@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from ab_testing import RecommendationExperiment
 from data_processing import load_movielens, encode_ids, build_interaction_matrix, split_data, get_genre_features
-from models import ALSModel, NCFModel, TwoTowerModel
+from models import CollaborativeFilteringALS, NeuralMatrixFactorization, TwoTowerRetrieval
 from metrics import ndcg_at_k, recall_at_k, hit_rate_at_k, mrr_at_k
 from trainer import train_neural_model, InteractionDataset, get_device
 
@@ -147,8 +147,8 @@ def main():
     results = {}
 
     # ── 3a: ALS ──
-    print("\n--- ALS Baseline ---")
-    als = ALSModel(n_factors=args.n_factors, n_iterations=15, regularization=0.01)
+    print("\n--- ALS Baseline (CollaborativeFilteringALS) ---")
+    als = CollaborativeFilteringALS(n_factors=args.n_factors, iterations=15, regularization=0.01)
     als.fit(interaction_matrix)
     results["ALS"] = evaluate_model(als, val_df, n_users, n_items, model_type="als")
     print(f"  ALS → {results['ALS']}")
@@ -164,8 +164,8 @@ def main():
     )
 
     # ── 3b: NCF ──
-    print("\n--- NCF ---")
-    ncf = NCFModel(n_users=n_users, n_items=n_items, n_factors=args.n_factors)
+    print("\n--- NCF (NeuralMatrixFactorization) ---")
+    ncf = NeuralMatrixFactorization(n_users=n_users, n_items=n_items, mf_dim=args.n_factors)
     val_fn_ncf = lambda m: evaluate_model(m, val_df, n_users, n_items, device=device)["NDCG@10"]
     ncf = train_neural_model(
         model=ncf, train_dataset=train_dataset, val_fn=val_fn_ncf,
@@ -176,10 +176,10 @@ def main():
     print(f"  NCF → {results['NCF']}")
 
     # ── 3c: Two-Tower ──
-    print("\n--- Two-Tower ---")
-    two_tower = TwoTowerModel(
+    print("\n--- Two-Tower (TwoTowerRetrieval) ---")
+    two_tower = TwoTowerRetrieval(
         n_users=n_users, n_items=n_items,
-        n_factors=args.n_factors, n_genres=len(genre_names)
+        n_genres=len(genre_names), embed_dim=args.n_factors
     )
     val_fn_tt = lambda m: evaluate_model(m, val_df, n_users, n_items, device=device)["NDCG@10"]
     two_tower = train_neural_model(
@@ -201,7 +201,8 @@ def main():
     print("="*60)
 
     # Save results
-    output = {"models": results, "ab_test": ab_results if not args.skip_ab else {}}
+    ab_results_out = ab_results if not args.skip_ab else {}
+    output = {"models": results, "ab_test": ab_results_out}
     with open("results.json", "w") as f:
         json.dump(output, f, indent=2)
     print("\n✔ Results saved to results.json")
