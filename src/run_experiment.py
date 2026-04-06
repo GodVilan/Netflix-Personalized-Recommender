@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from ab_testing import RecommendationExperiment
 from data_processing import load_movielens, encode_ids, build_interaction_matrix, split_data, get_genre_features
 from models import CollaborativeFilteringALS, NeuralMatrixFactorization, TwoTowerRetrieval
-from metrics import ndcg_at_k, recall_at_k, hit_rate_at_k, mrr_at_k
+from metrics import ndcg_at_k, recall_at_k, hit_rate_at_k, mrr
 from trainer import train_neural_model, InteractionDataset, get_device
 
 
@@ -57,10 +57,10 @@ def evaluate_model(model, val_df, n_users, n_items, k=10, device=None, model_typ
         user_val = val_df[val_df["user_idx"] == user]
         if len(user_val) == 0:
             continue
-        true_items = user_val["item_idx"].values.tolist()
+        true_items = set(user_val["item_idx"].values.tolist())  # metrics expect a set
 
         if model_type == "als":
-            scores = model.recommend(user, n_items)
+            top_k = model.recommend(user, k).tolist()
         else:
             # Neural models: score all items
             model.eval()
@@ -71,18 +71,18 @@ def evaluate_model(model, val_df, n_users, n_items, k=10, device=None, model_typ
                     user_tensor = user_tensor.to(device)
                     item_tensor = item_tensor.to(device)
                 scores = model.score(user_tensor, item_tensor).cpu().numpy()
+            top_k = np.argsort(scores)[::-1][:k].tolist()
 
-        top_k = np.argsort(scores)[::-1][:k].tolist()
-        ndcgs.append(ndcg_at_k(true_items, top_k, k))
-        recalls.append(recall_at_k(true_items, top_k, k))
-        hits.append(hit_rate_at_k(true_items, top_k, k))
-        mrrs.append(mrr_at_k(true_items, top_k, k))
+        ndcgs.append(ndcg_at_k(top_k, true_items, k))
+        recalls.append(recall_at_k(top_k, true_items, k))
+        hits.append(hit_rate_at_k(top_k, true_items, k))
+        mrrs.append(mrr(top_k, true_items))
 
     return {
         f"NDCG@{k}": round(float(np.mean(ndcgs)), 4),
         f"Recall@{k}": round(float(np.mean(recalls)), 4),
         f"HitRate@{k}": round(float(np.mean(hits)), 4),
-        f"MRR@{k}": round(float(np.mean(mrrs)), 4),
+        f"MRR": round(float(np.mean(mrrs)), 4),
     }
 
 
@@ -106,6 +106,7 @@ def main():
     device = get_device()
 
     # ── Step 1: A/B Simulation ──
+    ab_results = {}
     if not args.skip_ab:
         print("\n[1/4] Running A/B test simulation (Thompson Sampling)...")
         ab_results = simulate_ab_test(n_rounds=args.ab_rounds)
@@ -193,16 +194,15 @@ def main():
     # ── Step 4: Results Table ──
     print("\n[4/4] Final Results")
     print("\n" + "="*60)
-    header = f"{'Model':<12} {'NDCG@10':>10} {'Recall@10':>10} {'HitRate@10':>12} {'MRR@10':>8}"
+    header = f"{'Model':<12} {'NDCG@10':>10} {'Recall@10':>10} {'HitRate@10':>12} {'MRR':>8}"
     print(header)
     print("-"*60)
     for model_name, metrics in results.items():
-        print(f"{model_name:<12} {metrics['NDCG@10']:>10} {metrics['Recall@10']:>10} {metrics['HitRate@10']:>12} {metrics['MRR@10']:>8}")
+        print(f"{model_name:<12} {metrics['NDCG@10']:>10} {metrics['Recall@10']:>10} {metrics['HitRate@10']:>12} {metrics['MRR']:>8}")
     print("="*60)
 
     # Save results
-    ab_results_out = ab_results if not args.skip_ab else {}
-    output = {"models": results, "ab_test": ab_results_out}
+    output = {"models": results, "ab_test": ab_results}
     with open("results.json", "w") as f:
         json.dump(output, f, indent=2)
     print("\n✔ Results saved to results.json")
