@@ -5,8 +5,9 @@ Features:
   - Negative sampling (uniform + popularity-biased)
   - Early stopping based on validation NDCG@10
   - Learning rate scheduling (cosine annealing with warm restarts)
-  - Mixed precision training (torch.amp)
+  - Mixed precision training (torch.amp) — CUDA only; MPS uses float16 autocast
   - MLflow experiment tracking
+Device priority: CUDA (Colab/cloud) > MPS (Apple Silicon) > CPU
 """
 
 import time
@@ -20,6 +21,31 @@ import mlflow
 import mlflow.pytorch
 
 
+# ── Device Selection ────────────────────────────────────────────────────────
+def get_device() -> torch.device:
+    """
+    Returns the best available device:
+      1. CUDA  — Colab T4/A100, any NVIDIA GPU
+      2. MPS   — Apple Silicon (M1/M2/M3/M4 Mac)
+      3. CPU   — Fallback
+    """
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    print(f"[Device] Using: {device} ", end="")
+    if device.type == "cuda":
+        print(f"({torch.cuda.get_device_name(0)})")
+    elif device.type == "mps":
+        print("(Apple Silicon GPU)")
+    else:
+        print("(CPU — no GPU found)")
+    return device
+
+
+# ── Dataset ─────────────────────────────────────────────────────────────────
 class InteractionDataset(Dataset):
     """
     Dataset for NCF / Two-Tower training.
@@ -74,6 +100,7 @@ class InteractionDataset(Dataset):
         return sample
 
 
+# ── Early Stopping ───────────────────────────────────────────────────────────
 class EarlyStopping:
     def __init__(self, patience: int = 5, min_delta: float = 1e-4):
         self.patience = patience
@@ -98,29 +125,46 @@ class EarlyStopping:
             model.load_state_dict(self.best_state)
 
 
+# ── Training Loop ────────────────────────────────────────────────────────────
 def train_neural_model(
     model: nn.Module,
     train_dataset: InteractionDataset,
-    val_fn,                        # callable(model) -> float (e.g., NDCG@10)
+    val_fn,                         # callable(model) -> float (e.g., NDCG@10)
     model_name: str = "model",
     epochs: int = 20,
     batch_size: int = 2048,
     lr: float = 1e-3,
     weight_decay: float = 1e-5,
     patience: int = 5,
-    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    device: Optional[torch.device] = None,
     use_mlflow: bool = True,
 ) -> nn.Module:
-    device = torch.device(device)
+    # ── Auto-select best device if not specified ──
+    if device is None:
+        device = get_device()
+    else:
+        device = torch.device(device)
+
     model = model.to(device)
+
+    # ── AMP setup ────────────────────────────────
+    # CUDA:  full AMP with GradScaler (fastest)
+    # MPS:   autocast only — GradScaler not supported on MPS
+    # CPU:   no AMP
+    use_amp_cuda = (device.type == "cuda")
+    use_amp_mps  = (device.type == "mps")
+
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp_cuda)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2)
-    scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
 
     loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True,
-        num_workers=0, pin_memory=(device.type == "cuda")
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=use_amp_cuda,   # pin_memory only safe on CUDA
     )
 
     stopper = EarlyStopping(patience=patience)
@@ -131,10 +175,12 @@ def train_neural_model(
             "epochs": epochs, "batch_size": batch_size,
             "lr": lr, "weight_decay": weight_decay,
             "n_neg": train_dataset.n_neg,
+            "device": device.type,
         })
 
     print(f"\n{'='*60}")
     print(f"Training {model_name} on {device}")
+    print(f"AMP: {'CUDA GradScaler' if use_amp_cuda else 'MPS autocast float16' if use_amp_mps else 'disabled'}")
     print(f"{'='*60}")
 
     for epoch in range(1, epochs + 1):
@@ -146,20 +192,41 @@ def train_neural_model(
             optimizer.zero_grad(set_to_none=True)
             batch = {k: v.to(device) for k, v in batch.items()}
 
-            with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
-                loss = model(
-                    batch["user"],
-                    batch["pos_item"],
-                    batch["neg_items"],
-                    batch.get("pos_genre"),
-                    batch.get("neg_genres"),
-                )
+            # ── Forward pass with appropriate AMP context ──
+            if use_amp_cuda:
+                # CUDA: full mixed precision with GradScaler
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    loss = model(
+                        batch["user"], batch["pos_item"], batch["neg_items"],
+                        batch.get("pos_genre"), batch.get("neg_genres"),
+                    )
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            elif use_amp_mps:
+                # MPS: autocast only (no GradScaler support yet)
+                with torch.autocast(device_type="mps", dtype=torch.float16):
+                    loss = model(
+                        batch["user"], batch["pos_item"], batch["neg_items"],
+                        batch.get("pos_genre"), batch.get("neg_genres"),
+                    )
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+
+            else:
+                # CPU: standard float32
+                loss = model(
+                    batch["user"], batch["pos_item"], batch["neg_items"],
+                    batch.get("pos_genre"), batch.get("neg_genres"),
+                )
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+
             epoch_loss += loss.item()
 
         scheduler.step()
