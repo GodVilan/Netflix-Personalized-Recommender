@@ -105,13 +105,13 @@ class RecommendationExperiment:
         effect_size = abs(a.ctr - b.ctr)
         return {
             "test": "chi_squared",
-            "chi2_statistic": round(chi2, 4),
-            "p_value": round(p_value, 6),
-            "significant": p_value < self.alpha,
-            "arm_a_ctr": round(a.ctr, 4),
-            "arm_b_ctr": round(b.ctr, 4),
-            "absolute_lift": round(effect_size, 4),
-            "relative_lift_pct": round(effect_size / (a.ctr + 1e-10) * 100, 2),
+            "chi2_statistic": round(float(chi2), 4),
+            "p_value": round(float(p_value), 6),
+            "significant": bool(p_value < self.alpha),   # ← cast to Python bool
+            "arm_a_ctr": round(float(a.ctr), 4),
+            "arm_b_ctr": round(float(b.ctr), 4),
+            "absolute_lift": round(float(effect_size), 4),
+            "relative_lift_pct": round(float(effect_size / (a.ctr + 1e-10) * 100), 2),
         }
 
     def welch_t_test(self, arm_a: str, arm_b: str) -> dict:
@@ -127,12 +127,12 @@ class RecommendationExperiment:
         )
         return {
             "test": "welch_t",
-            "t_statistic": round(t_stat, 4),
-            "p_value": round(p_value, 6),
-            "significant": p_value < self.alpha,
-            "arm_a_mean_engagement": round(a.avg_engagement, 2),
-            "arm_b_mean_engagement": round(b.avg_engagement, 2),
-            "cohens_d": round(cohens_d, 4),
+            "t_statistic": round(float(t_stat), 4),
+            "p_value": round(float(p_value), 6),
+            "significant": bool(p_value < self.alpha),   # ← cast to Python bool
+            "arm_a_mean_engagement": round(float(a.avg_engagement), 2),
+            "arm_b_mean_engagement": round(float(b.avg_engagement), 2),
+            "cohens_d": round(float(cohens_d), 4),
         }
 
     def power_analysis(
@@ -155,16 +155,16 @@ class RecommendationExperiment:
         arm_names = list(self.arms.keys())
         for name, arm in self.arms.items():
             arm_stats[name] = {
-                "impressions": arm.impressions,
-                "clicks": arm.clicks,
-                "ctr": round(arm.ctr, 4),
-                "avg_engagement_sec": round(arm.avg_engagement, 2),
-                "thompson_posterior_mean": round(arm.alpha / (arm.alpha + arm.beta), 4),
+                "impressions": int(arm.impressions),
+                "clicks": int(arm.clicks),
+                "ctr": round(float(arm.ctr), 4),
+                "avg_engagement_sec": round(float(arm.avg_engagement), 2),
+                "thompson_posterior_mean": round(float(arm.alpha / (arm.alpha + arm.beta)), 4),
             }
         result = {
             "experiment": self.name,
             "mode": self.mode,
-            "total_requests": self.total_requests,
+            "total_requests": int(self.total_requests),
             "arms": arm_stats,
         }
         # Pairwise tests if enough data
