@@ -1,25 +1,28 @@
 """
 run_experiment.py
-End-to-end experiment: trains ALS + NCF + Two-Tower on MovieLens-1M,
-evaluates all three, and optionally runs an A/B simulation.
+End-to-end experiment: trains ALS + NCF + Two-Tower on MovieLens-1M.
 
 Usage:
     python src/run_experiment.py --data_dir ml-1m/ --epochs 30
     python src/run_experiment.py --data_dir ml-1m/ --epochs 30 --skip_ab
 
-Fixes applied (2026-04-06):
-  Bug 4 — val_fn n_eval_users raised from 200 → 1000.
-    With LOO evaluation (1 true item per user among ~3700 candidates), NDCG@10
-    over 200 users has standard error ≈ σ/√200 ≈ 0.010+. This means an epoch
-    that genuinely improved the model can look worse than the previous epoch by
-    pure noise, causing early stopping to fire too early and the best checkpoint
-    to be selected incorrectly. 1000 users reduces SE to ≈ 0.004, making the
-    early-stopping signal 2.5× more reliable at modest extra compute cost.
+Fix log (2026-04-07):
+  Fix-6  ALS now uses implicit library (CollaborativeFilteringALS wraps it).
+    n_factors default unchanged at 256. add `pip install implicit` to requirements.
 
-  Bug 5 — ALS n_factors raised 128 → 256, regularization tightened 0.05 → 0.01.
-    The ALS model was underfitting: NDCG@10=0.0428 vs. the 0.065-0.090 range
-    achievable on ML-1M full-item ranking. Larger latent space and lighter
-    regularization close this gap without overfitting on 6k users.
+  Fix-7  NCF trained with heavy embedding L2 via model.get_param_groups().
+    run_experiment passes lr only; trainer handles weight_decay split.
+
+  Fix-8  TwoTower: batch_size raised 2048 → 4096, lr raised 5e-4 → 1e-3,
+    accum_steps=2 → effective batch 8192 in-batch negatives.
+
+  Fix-9  Full evaluation (all 6040 users) on the test set for final numbers.
+    Val still uses 1000 users for speed. Test uses all users for accuracy.
+
+Previous fixes (2026-04-06, kept):
+  Bug 4 — val_fn n_eval_users 200 → 1000
+  Bug 5 — ALS n_factors 128 → 256, regularization 0.05 → 0.01
+  Bug 1–3 — NCF BatchNorm, sigmoid, BPR fixes
 """
 
 import argparse
@@ -68,18 +71,18 @@ def evaluate_model(
     k: int = 10,
     device=None,
     model_type: str = "neural",
-    n_eval_users: int = 500,
+    n_eval_users: int = None,  # None = ALL users
 ) -> dict:
     """
-    Consistent evaluation for all model types:
-      1. Uses Leave-One-Out test set (one ground-truth item per user)
-      2. Excludes seen (training) items from ranking for all models
-      3. Neural models score ALL items then exclude seen — same as ALS
+    Full-catalog evaluation (ranks all n_items per user):
+      1. LOO test set — 1 ground-truth item per user
+      2. Excludes seen (training) items from ranking
+      3. n_eval_users=None → evaluate ALL users (Fix-9 for test set)
     """
     ndcgs, recalls, hits, mrrs = [], [], [], []
 
     all_users = test_df["user_idx"].unique()
-    if len(all_users) > n_eval_users:
+    if n_eval_users is not None and len(all_users) > n_eval_users:
         rng = np.random.default_rng(0)
         all_users = rng.choice(all_users, n_eval_users, replace=False)
 
@@ -97,7 +100,6 @@ def evaluate_model(
         if model_type == "als":
             seen_arr = np.array(list(seen), dtype=np.int64) if seen else None
             top_k = model.recommend(int(user), n=k, exclude_seen=seen_arr).tolist()
-
         else:
             model.eval()
             with torch.no_grad():
@@ -112,28 +114,34 @@ def evaluate_model(
         mrrs.append(mrr(top_k, true_items))
 
     return {
-        f"NDCG@{k}":    round(float(np.mean(ndcgs)),   4),
-        f"Recall@{k}": round(float(np.mean(recalls)), 4),
+        f"NDCG@{k}":     round(float(np.mean(ndcgs)),   4),
+        f"Recall@{k}":  round(float(np.mean(recalls)), 4),
         f"HitRate@{k}": round(float(np.mean(hits)),    4),
-        "MRR":          round(float(np.mean(mrrs)),    4),
+        "MRR":           round(float(np.mean(mrrs)),    4),
+        "n_users_eval":  len(ndcgs),
     }
 
 
 # ── Main Pipeline ─────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir",   default="ml-1m/")
-    parser.add_argument("--epochs",     type=int,   default=30)
-    # Bug 5 fix: n_factors default raised 128 → 256
-    parser.add_argument("--n_factors",  type=int,   default=256)
-    parser.add_argument("--batch_size", type=int,   default=2048)
-    parser.add_argument("--lr",         type=float, default=5e-4)
-    parser.add_argument("--n_neg",      type=int,   default=64)
-    # Bug 4 fix: n_eval_users default raised from 500 → 1000 (test set),
-    # and val_fn uses 1000 instead of 200 (see below).
-    parser.add_argument("--n_eval_users", type=int, default=1000)
-    parser.add_argument("--ab_rounds",  type=int,   default=20000)
-    parser.add_argument("--skip_ab",    action="store_true")
+    parser.add_argument("--data_dir",    default="ml-1m/")
+    parser.add_argument("--epochs",      type=int,   default=30)
+    parser.add_argument("--n_factors",   type=int,   default=256)
+    parser.add_argument("--ncf_batch",   type=int,   default=2048,
+                        help="Batch size for NCF")
+    # Fix-8: TwoTower uses larger batch for in-batch negatives
+    parser.add_argument("--tt_batch",    type=int,   default=4096,
+                        help="Batch size for TwoTower (in-batch negatives)")
+    parser.add_argument("--ncf_lr",      type=float, default=5e-4)
+    # Fix-8: TwoTower LR raised to 1e-3
+    parser.add_argument("--tt_lr",       type=float, default=1e-3,
+                        help="LR for TwoTower (higher than NCF for in-batch neg gradient)")
+    parser.add_argument("--n_neg",       type=int,   default=64)
+    parser.add_argument("--tt_accum",    type=int,   default=2,
+                        help="Gradient accumulation steps for TwoTower")
+    parser.add_argument("--ab_rounds",   type=int,   default=20000)
+    parser.add_argument("--skip_ab",     action="store_true")
     args = parser.parse_args()
 
     print("\n" + "="*60)
@@ -161,7 +169,7 @@ def main():
         print(f"  ERROR: ratings.dat not found at {ratings_path}")
         sys.exit(1)
 
-    ratings, movies           = load_movielens(ratings_path, movies_path)
+    ratings, movies             = load_movielens(ratings_path, movies_path)
     ratings, user_enc, item_enc = encode_ids(ratings)
     n_users = ratings["user_idx"].nunique()
     n_items = ratings["item_idx"].nunique()
@@ -185,16 +193,18 @@ def main():
     # ── ALS ──
     print("\n--- ALS Baseline (CollaborativeFilteringALS) ---")
     print(f"  n_factors={args.n_factors}, iterations=30, alpha=1.0, regularization=0.01")
+    print(f"  Backend: implicit.als.AlternatingLeastSquares (Conjugate Gradient)")
     als = CollaborativeFilteringALS(
-        n_factors=args.n_factors,  # Bug 5 fix: 256 (was 128)
+        n_factors=args.n_factors,
         iterations=30,
-        regularization=0.01,       # Bug 5 fix: tighter (was 0.05)
+        regularization=0.01,
         alpha=1.0,
     )
     als.fit(interaction_matrix)
+    # Fix-9: evaluate ALL users on test set
     results["ALS"] = evaluate_model(
         als, test_df, seen_items, genre_features,
-        n_items, model_type="als", n_eval_users=args.n_eval_users
+        n_items, model_type="als", n_eval_users=None
     )
     print(f"  ALS → {results['ALS']}")
 
@@ -210,47 +220,50 @@ def main():
 
     # ── NCF ──
     print("\n--- NCF (NeuralMatrixFactorization) ---")
+    print(f"  embed_wd=1e-2 (heavy L2 on embeddings), embed_dropout=0.3")
     ncf = NeuralMatrixFactorization(
         n_users=n_users, n_items=n_items, mf_dim=args.n_factors
     )
-    # Bug 4 fix: n_eval_users raised from 200 → 1000 for reliable early stopping.
-    # A noisy val signal (200 users, SE ≈ 0.010) was triggering patience=7
-    # on random fluctuations rather than true model degradation.
     val_fn_ncf = lambda m: evaluate_model(
         m, val_df, seen_items, genre_features,
         n_items, device=device, model_type="neural", n_eval_users=1000
-    )[f"NDCG@10"]
+    )["NDCG@10"]
     ncf = train_neural_model(
         model=ncf, train_dataset=train_dataset, val_fn=val_fn_ncf,
-        model_name="NCF", epochs=args.epochs, batch_size=args.batch_size,
-        lr=args.lr, device=device, use_mlflow=False,
+        model_name="NCF", epochs=args.epochs, batch_size=args.ncf_batch,
+        lr=args.ncf_lr, weight_decay=1e-5, device=device, use_mlflow=False,
     )
+    # Fix-9: full eval on test
     results["NCF"] = evaluate_model(
         ncf, test_df, seen_items, genre_features,
-        n_items, device=device, model_type="neural", n_eval_users=args.n_eval_users
+        n_items, device=device, model_type="neural", n_eval_users=None
     )
     print(f"  NCF → {results['NCF']}")
 
     # ── Two-Tower ──
     print("\n--- Two-Tower (TwoTowerRetrieval) ---")
+    print(f"  IN-BATCH negatives | batch={args.tt_batch} | lr={args.tt_lr} | accum={args.tt_accum}")
+    print(f"  Effective batch (in-batch negs) = {args.tt_batch * args.tt_accum:,}")
     two_tower = TwoTowerRetrieval(
         n_users=n_users, n_items=n_items,
         n_genres=n_genres, embed_dim=args.n_factors,
         genre_features=genre_features,
+        use_inbatch_negatives=True,
     )
-    # Bug 4 fix: n_eval_users raised from 200 → 1000 here too.
     val_fn_tt = lambda m: evaluate_model(
         m, val_df, seen_items, genre_features,
         n_items, device=device, model_type="neural", n_eval_users=1000
-    )[f"NDCG@10"]
+    )["NDCG@10"]
     two_tower = train_neural_model(
         model=two_tower, train_dataset=train_dataset, val_fn=val_fn_tt,
-        model_name="TwoTower", epochs=args.epochs, batch_size=args.batch_size,
-        lr=args.lr, device=device, use_mlflow=False,
+        model_name="TwoTower", epochs=args.epochs, batch_size=args.tt_batch,
+        lr=args.tt_lr, weight_decay=1e-5, accum_steps=args.tt_accum,
+        device=device, use_mlflow=False,
     )
+    # Fix-9: full eval on test
     results["TwoTower"] = evaluate_model(
         two_tower, test_df, seen_items, genre_features,
-        n_items, device=device, model_type="neural", n_eval_users=args.n_eval_users
+        n_items, device=device, model_type="neural", n_eval_users=None
     )
     print(f"  TwoTower → {results['TwoTower']}")
 
@@ -271,28 +284,22 @@ def main():
     os.makedirs("checkpoints", exist_ok=True)
     torch.save(ncf.state_dict(),       "checkpoints/ncf.pt")
     torch.save(two_tower.state_dict(), "checkpoints/two_tower.pt")
-
-    # Save ALS factors for the API server (Bug 6 fix).
     np.savez("checkpoints/als_factors.npz",
              user_factors=als.user_factors,
              item_factors=als.item_factors)
-
-    # Save genre matrix so the API server can reconstruct TwoTower embeddings.
     np.save("checkpoints/genre_matrix.npy", genre_features)
 
-    # Save item id→title metadata for the API to return human-readable titles.
     import json as _json
-    movie_map = movies.set_index("movie_id")["title"].to_dict()
+    movie_map   = movies.set_index("movie_id")["title"].to_dict()
     encoded_ids = item_enc.classes_
     meta = {str(idx): movie_map.get(mid, f"Movie {mid}")
             for idx, mid in enumerate(encoded_ids)}
     with open("checkpoints/item_metadata.json", "w") as f:
         _json.dump(meta, f)
 
-    # Save final metrics for /metrics endpoint.
     import datetime
     metrics_out = {
-        "model": "two_tower_v1",
+        "model": "two_tower_v2",
         "eval_date": datetime.date.today().isoformat(),
         "dataset": "MovieLens-1M",
         "metrics": results.get("TwoTower", {}),

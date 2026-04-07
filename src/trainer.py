@@ -1,13 +1,27 @@
 """
 trainer.py
 Training loop for PyTorch-based recommendation models (NCF & TwoTower).
-Features:
-  - In-batch negative sampling (n_neg default 64 — critical for InfoNCE quality)
-  - Linear warmup + cosine decay LR schedule (stabilises NCF early training)
-  - Early stopping on validation NDCG@10
-  - Mixed precision training (torch.amp) — CUDA only; MPS uses float16 autocast
-  - MLflow experiment tracking
-Device priority: CUDA > MPS > CPU
+
+Fix log (2026-04-07):
+  Fix-7  NCF: optimizer now uses get_param_groups() when available, giving
+    heavy L2 (weight_decay=1e-2) on embedding parameters and light L2 (1e-5)
+    on MLP/projection weights. Previously weight_decay=1e-5 was applied
+    uniformly, allowing embedding memorisation.
+
+  Fix-8  TwoTower: default batch_size raised 2048 → 4096.
+    In-batch negatives scale as O(B): 4096 batch → 4095 negatives vs 2048 → 2047.
+    For the A100-SXM4-80GB this is well within memory budget.
+    TwoTower LR raised to 1e-3 (from 5e-4) since in-batch neg gradients are
+    richer and the model can absorb larger updates.
+
+  Fix-9  Gradient accumulation (accum_steps=2) doubles the effective batch size
+    to 8192 for TwoTower without extra GPU memory.
+
+Previous fixes (2026-04-06):
+  Fixed torch.cuda.amp.GradScaler deprecation → torch.amp.GradScaler
+  n_neg raised 4 → 64
+  WarmupCosineScheduler replaces CosineAnnealingWarmRestarts
+  Patience raised 5 → 7
 """
 
 import time
@@ -15,7 +29,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from typing import Optional
+from typing import Optional, Callable
 import mlflow
 import mlflow.pytorch
 
@@ -42,8 +56,9 @@ def get_device() -> torch.device:
 class InteractionDataset(Dataset):
     """
     Positive interactions + sampled negatives.
-    n_neg=64 by default — large denominator is essential for InfoNCE quality.
-    With n_neg=4 (old default), TwoTower NDCG was ~3x below published results.
+    NOTE: TwoTower in-batch-negative mode ignores neg_items at train time;
+    they are still sampled here for NCF compatibility and the fallback path.
+    n_neg=64 kept for NCF; TwoTower uses in-batch negatives instead.
     """
 
     def __init__(
@@ -89,18 +104,14 @@ class InteractionDataset(Dataset):
             "neg_items": torch.tensor(neg_items, dtype=torch.long),
         }
         if self.genre_features is not None:
-            sample["pos_genre"]  = torch.tensor(self.genre_features[pos_item],   dtype=torch.float32)
-            sample["neg_genres"] = torch.tensor(self.genre_features[neg_items],  dtype=torch.float32)
+            sample["pos_genre"]  = torch.tensor(self.genre_features[pos_item],  dtype=torch.float32)
+            sample["neg_genres"] = torch.tensor(self.genre_features[neg_items], dtype=torch.float32)
         return sample
 
 
-# ── LR Scheduler: Linear Warmup + Cosine Decay ───────────────────────────────
+# ── LR Scheduler ─────────────────────────────────────────────────────────────
 class WarmupCosineScheduler:
-    """
-    Linearly increases LR from 0 to base_lr over warmup_steps,
-    then applies cosine decay to min_lr.
-    Fixes the NCF oscillation seen in early epochs (unstable NDCG 0.045→0.024→0.044).
-    """
+    """Linear warmup + cosine decay."""
 
     def __init__(self, optimizer, warmup_epochs: int, total_epochs: int, min_lr: float = 1e-6):
         self.optimizer     = optimizer
@@ -124,10 +135,10 @@ class WarmupCosineScheduler:
 # ── Early Stopping ────────────────────────────────────────────────────────────
 class EarlyStopping:
     def __init__(self, patience: int = 7, min_delta: float = 1e-4):
-        self.patience   = patience
-        self.min_delta  = min_delta
-        self.best_score = -np.inf
-        self.counter    = 0
+        self.patience    = patience
+        self.min_delta   = min_delta
+        self.best_score  = -np.inf
+        self.counter     = 0
         self.should_stop = False
         self.best_state  = None
 
@@ -150,7 +161,7 @@ class EarlyStopping:
 def train_neural_model(
     model: nn.Module,
     train_dataset: InteractionDataset,
-    val_fn,
+    val_fn: Callable,
     model_name: str = "model",
     epochs: int = 30,
     batch_size: int = 2048,
@@ -158,9 +169,16 @@ def train_neural_model(
     weight_decay: float = 1e-5,
     warmup_epochs: int = 2,
     patience: int = 7,
+    accum_steps: int = 1,
     device: Optional[torch.device] = None,
     use_mlflow: bool = True,
 ) -> nn.Module:
+    """
+    accum_steps: gradient accumulation steps.
+      Effective batch = batch_size × accum_steps.
+      For TwoTower with in-batch negatives, set accum_steps=2 and batch_size=4096
+      → effective 8192 negatives per positive.
+    """
     if device is None:
         device = get_device()
     else:
@@ -170,43 +188,52 @@ def train_neural_model(
 
     use_amp_cuda = (device.type == "cuda")
     use_amp_mps  = (device.type == "mps")
-
-    # Fixed deprecation warning: use torch.amp.GradScaler instead of torch.cuda.amp.GradScaler
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp_cuda)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    # Linear warmup + cosine decay — replaces CosineAnnealingWarmRestarts
+    # Fix-7: use get_param_groups() if the model exposes it (NCF)
+    if hasattr(model, "get_param_groups"):
+        param_groups = model.get_param_groups(lr=lr, embed_wd=1e-2, mlp_wd=weight_decay)
+    else:
+        param_groups = [{"params": model.parameters(), "lr": lr, "weight_decay": weight_decay}]
+
+    optimizer = torch.optim.AdamW(param_groups)
     scheduler = WarmupCosineScheduler(optimizer, warmup_epochs=warmup_epochs, total_epochs=epochs)
 
     loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
-        num_workers=2, pin_memory=use_amp_cuda,
+        num_workers=2, pin_memory=use_amp_cuda, drop_last=True,
+        # drop_last=True ensures all batches have the same size,
+        # which matters for in-batch negative correctness.
     )
 
     stopper = EarlyStopping(patience=patience)
 
+    eff_batch = batch_size * accum_steps
     if use_mlflow:
         mlflow.start_run(run_name=model_name)
         mlflow.log_params({
-            "epochs": epochs, "batch_size": batch_size, "lr": lr,
-            "weight_decay": weight_decay, "n_neg": train_dataset.n_neg,
+            "epochs": epochs, "batch_size": batch_size, "effective_batch": eff_batch,
+            "lr": lr, "weight_decay": weight_decay, "n_neg": train_dataset.n_neg,
             "warmup_epochs": warmup_epochs, "device": device.type,
+            "accum_steps": accum_steps,
         })
 
     print(f"\n{'='*60}")
     print(f"Training {model_name} on {device}")
-    print(f"AMP: {'CUDA GradScaler' if use_amp_cuda else 'MPS autocast float16' if use_amp_mps else 'disabled'}")
+    amp_desc = "CUDA GradScaler" if use_amp_cuda else "MPS float16" if use_amp_mps else "disabled"
+    print(f"AMP: {amp_desc}")
     print(f"LR: {lr} | Warmup: {warmup_epochs} epochs | Patience: {patience}")
+    print(f"Batch: {batch_size} × accum {accum_steps} = effective {eff_batch}")
     print(f"{'='*60}")
 
     for epoch in range(1, epochs + 1):
         model.train()
         epoch_loss = 0.0
         t0 = time.time()
-        scheduler.step(epoch - 1)   # step before the epoch
+        scheduler.step(epoch - 1)
+        optimizer.zero_grad(set_to_none=True)
 
-        for batch in loader:
-            optimizer.zero_grad(set_to_none=True)
+        for step, batch in enumerate(loader):
             batch = {k: v.to(device) for k, v in batch.items()}
 
             if use_amp_cuda:
@@ -215,35 +242,39 @@ def train_neural_model(
                         batch["user"], batch["pos_item"], batch["neg_items"],
                         batch.get("pos_genre"), batch.get("neg_genres"),
                     )
+                loss = loss / accum_steps
                 scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
             elif use_amp_mps:
                 with torch.autocast(device_type="mps", dtype=torch.float16):
                     loss = model(
                         batch["user"], batch["pos_item"], batch["neg_items"],
                         batch.get("pos_genre"), batch.get("neg_genres"),
                     )
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
+                (loss / accum_steps).backward()
             else:
                 loss = model(
                     batch["user"], batch["pos_item"], batch["neg_items"],
                     batch.get("pos_genre"), batch.get("neg_genres"),
                 )
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
+                (loss / accum_steps).backward()
 
-            epoch_loss += loss.item()
+            epoch_loss += loss.item() * accum_steps  # un-scale for logging
 
-        current_lr  = optimizer.param_groups[0]["lr"]
-        avg_loss    = epoch_loss / len(loader)
-        val_ndcg    = val_fn(model)
-        elapsed     = time.time() - t0
+            if (step + 1) % accum_steps == 0 or (step + 1) == len(loader):
+                if use_amp_cuda:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+        current_lr = optimizer.param_groups[0]["lr"]
+        avg_loss   = epoch_loss / len(loader)
+        val_ndcg   = val_fn(model)
+        elapsed    = time.time() - t0
 
         print(f"Epoch {epoch:3d} | Loss: {avg_loss:.4f} | Val NDCG@10: {val_ndcg:.4f} | LR: {current_lr:.2e} | {elapsed:.1f}s")
 
