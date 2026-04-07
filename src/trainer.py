@@ -2,12 +2,12 @@
 trainer.py
 Training loop for PyTorch-based recommendation models (NCF & TwoTower).
 Features:
-  - Negative sampling (uniform + popularity-biased)
-  - Early stopping based on validation NDCG@10
-  - Learning rate scheduling (cosine annealing with warm restarts)
+  - In-batch negative sampling (n_neg default 64 — critical for InfoNCE quality)
+  - Linear warmup + cosine decay LR schedule (stabilises NCF early training)
+  - Early stopping on validation NDCG@10
   - Mixed precision training (torch.amp) — CUDA only; MPS uses float16 autocast
   - MLflow experiment tracking
-Device priority: CUDA (Colab/cloud) > MPS (Apple Silicon) > CPU
+Device priority: CUDA > MPS > CPU
 """
 
 import time
@@ -15,20 +15,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from typing import Optional
 import mlflow
 import mlflow.pytorch
 
 
-# ── Device Selection ────────────────────────────────────────────────────────
+# ── Device Selection ─────────────────────────────────────────────────────────
 def get_device() -> torch.device:
-    """
-    Returns the best available device:
-      1. CUDA  — Colab T4/A100, any NVIDIA GPU
-      2. MPS   — Apple Silicon (M1/M2/M3/M4 Mac)
-      3. CPU   — Fallback
-    """
     if torch.cuda.is_available():
         device = torch.device("cuda")
     elif torch.backends.mps.is_available():
@@ -45,11 +38,12 @@ def get_device() -> torch.device:
     return device
 
 
-# ── Dataset ─────────────────────────────────────────────────────────────────
+# ── Dataset ──────────────────────────────────────────────────────────────────
 class InteractionDataset(Dataset):
     """
-    Dataset for NCF / Two-Tower training.
-    For each positive (user, item) pair, samples `n_neg` negatives uniformly.
+    Positive interactions + sampled negatives.
+    n_neg=64 by default — large denominator is essential for InfoNCE quality.
+    With n_neg=4 (old default), TwoTower NDCG was ~3x below published results.
     """
 
     def __init__(
@@ -57,7 +51,7 @@ class InteractionDataset(Dataset):
         user_ids: np.ndarray,
         item_ids: np.ndarray,
         n_items: int,
-        n_neg: int = 4,
+        n_neg: int = 64,
         seen_items: Optional[dict] = None,
         genre_features: Optional[np.ndarray] = None,
     ):
@@ -66,7 +60,7 @@ class InteractionDataset(Dataset):
         self.n_items = n_items
         self.n_neg = n_neg
         self.seen = seen_items or {}
-        self.genre_features = genre_features  # (n_items, n_genres)
+        self.genre_features = genre_features
         self.rng = np.random.default_rng(42)
 
     def __len__(self):
@@ -85,35 +79,62 @@ class InteractionDataset(Dataset):
         return np.array(negs[:self.n_neg])
 
     def __getitem__(self, idx):
-        user = int(self.users[idx])
+        user     = int(self.users[idx])
         pos_item = int(self.items[idx])
         neg_items = self._sample_negatives(user)
 
         sample = {
-            "user": torch.tensor(user, dtype=torch.long),
-            "pos_item": torch.tensor(pos_item, dtype=torch.long),
+            "user":      torch.tensor(user,     dtype=torch.long),
+            "pos_item":  torch.tensor(pos_item, dtype=torch.long),
             "neg_items": torch.tensor(neg_items, dtype=torch.long),
         }
         if self.genre_features is not None:
-            sample["pos_genre"] = torch.tensor(self.genre_features[pos_item], dtype=torch.float32)
-            sample["neg_genres"] = torch.tensor(self.genre_features[neg_items], dtype=torch.float32)
+            sample["pos_genre"]  = torch.tensor(self.genre_features[pos_item],   dtype=torch.float32)
+            sample["neg_genres"] = torch.tensor(self.genre_features[neg_items],  dtype=torch.float32)
         return sample
 
 
-# ── Early Stopping ───────────────────────────────────────────────────────────
+# ── LR Scheduler: Linear Warmup + Cosine Decay ───────────────────────────────
+class WarmupCosineScheduler:
+    """
+    Linearly increases LR from 0 to base_lr over warmup_steps,
+    then applies cosine decay to min_lr.
+    Fixes the NCF oscillation seen in early epochs (unstable NDCG 0.045→0.024→0.044).
+    """
+
+    def __init__(self, optimizer, warmup_epochs: int, total_epochs: int, min_lr: float = 1e-6):
+        self.optimizer     = optimizer
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs  = total_epochs
+        self.min_lr        = min_lr
+        self.base_lrs      = [pg["lr"] for pg in optimizer.param_groups]
+
+    def step(self, epoch: int):
+        if epoch < self.warmup_epochs:
+            scale = (epoch + 1) / max(self.warmup_epochs, 1)
+        else:
+            progress = (epoch - self.warmup_epochs) / max(self.total_epochs - self.warmup_epochs, 1)
+            scale    = 0.5 * (1.0 + np.cos(np.pi * progress))
+            scale    = self.min_lr / self.base_lrs[0] + scale * (1.0 - self.min_lr / self.base_lrs[0])
+
+        for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
+            pg["lr"] = base_lr * scale
+
+
+# ── Early Stopping ────────────────────────────────────────────────────────────
 class EarlyStopping:
-    def __init__(self, patience: int = 5, min_delta: float = 1e-4):
-        self.patience = patience
-        self.min_delta = min_delta
+    def __init__(self, patience: int = 7, min_delta: float = 1e-4):
+        self.patience   = patience
+        self.min_delta  = min_delta
         self.best_score = -np.inf
-        self.counter = 0
+        self.counter    = 0
         self.should_stop = False
-        self.best_state = None
+        self.best_state  = None
 
     def step(self, score: float, model: nn.Module):
         if score > self.best_score + self.min_delta:
             self.best_score = score
-            self.counter = 0
+            self.counter    = 0
             self.best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
         else:
             self.counter += 1
@@ -125,21 +146,21 @@ class EarlyStopping:
             model.load_state_dict(self.best_state)
 
 
-# ── Training Loop ────────────────────────────────────────────────────────────
+# ── Training Loop ─────────────────────────────────────────────────────────────
 def train_neural_model(
     model: nn.Module,
     train_dataset: InteractionDataset,
-    val_fn,                         # callable(model) -> float (e.g., NDCG@10)
+    val_fn,
     model_name: str = "model",
-    epochs: int = 20,
+    epochs: int = 30,
     batch_size: int = 2048,
-    lr: float = 1e-3,
+    lr: float = 5e-4,
     weight_decay: float = 1e-5,
-    patience: int = 5,
+    warmup_epochs: int = 2,
+    patience: int = 7,
     device: Optional[torch.device] = None,
     use_mlflow: bool = True,
 ) -> nn.Module:
-    # ── Auto-select best device if not specified ──
     if device is None:
         device = get_device()
     else:
@@ -147,24 +168,19 @@ def train_neural_model(
 
     model = model.to(device)
 
-    # ── AMP setup ────────────────────────────────
-    # CUDA:  full AMP with GradScaler (fastest)
-    # MPS:   autocast only — GradScaler not supported on MPS
-    # CPU:   no AMP
     use_amp_cuda = (device.type == "cuda")
     use_amp_mps  = (device.type == "mps")
 
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp_cuda)
+    # Fixed deprecation warning: use torch.amp.GradScaler instead of torch.cuda.amp.GradScaler
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp_cuda)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2)
+    # Linear warmup + cosine decay — replaces CosineAnnealingWarmRestarts
+    scheduler = WarmupCosineScheduler(optimizer, warmup_epochs=warmup_epochs, total_epochs=epochs)
 
     loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=use_amp_cuda,   # pin_memory only safe on CUDA
+        train_dataset, batch_size=batch_size, shuffle=True,
+        num_workers=2, pin_memory=use_amp_cuda,
     )
 
     stopper = EarlyStopping(patience=patience)
@@ -172,29 +188,28 @@ def train_neural_model(
     if use_mlflow:
         mlflow.start_run(run_name=model_name)
         mlflow.log_params({
-            "epochs": epochs, "batch_size": batch_size,
-            "lr": lr, "weight_decay": weight_decay,
-            "n_neg": train_dataset.n_neg,
-            "device": device.type,
+            "epochs": epochs, "batch_size": batch_size, "lr": lr,
+            "weight_decay": weight_decay, "n_neg": train_dataset.n_neg,
+            "warmup_epochs": warmup_epochs, "device": device.type,
         })
 
     print(f"\n{'='*60}")
     print(f"Training {model_name} on {device}")
     print(f"AMP: {'CUDA GradScaler' if use_amp_cuda else 'MPS autocast float16' if use_amp_mps else 'disabled'}")
+    print(f"LR: {lr} | Warmup: {warmup_epochs} epochs | Patience: {patience}")
     print(f"{'='*60}")
 
     for epoch in range(1, epochs + 1):
         model.train()
         epoch_loss = 0.0
         t0 = time.time()
+        scheduler.step(epoch - 1)   # step before the epoch
 
         for batch in loader:
             optimizer.zero_grad(set_to_none=True)
             batch = {k: v.to(device) for k, v in batch.items()}
 
-            # ── Forward pass with appropriate AMP context ──
             if use_amp_cuda:
-                # CUDA: full mixed precision with GradScaler
                 with torch.autocast(device_type="cuda", dtype=torch.float16):
                     loss = model(
                         batch["user"], batch["pos_item"], batch["neg_items"],
@@ -205,9 +220,7 @@ def train_neural_model(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
-
             elif use_amp_mps:
-                # MPS: autocast only (no GradScaler support yet)
                 with torch.autocast(device_type="mps", dtype=torch.float16):
                     loss = model(
                         batch["user"], batch["pos_item"], batch["neg_items"],
@@ -216,9 +229,7 @@ def train_neural_model(
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
-
             else:
-                # CPU: standard float32
                 loss = model(
                     batch["user"], batch["pos_item"], batch["neg_items"],
                     batch.get("pos_genre"), batch.get("neg_genres"),
@@ -229,15 +240,15 @@ def train_neural_model(
 
             epoch_loss += loss.item()
 
-        scheduler.step()
-        avg_loss = epoch_loss / len(loader)
-        val_ndcg = val_fn(model)
-        elapsed = time.time() - t0
+        current_lr  = optimizer.param_groups[0]["lr"]
+        avg_loss    = epoch_loss / len(loader)
+        val_ndcg    = val_fn(model)
+        elapsed     = time.time() - t0
 
-        print(f"Epoch {epoch:3d} | Loss: {avg_loss:.4f} | Val NDCG@10: {val_ndcg:.4f} | {elapsed:.1f}s")
+        print(f"Epoch {epoch:3d} | Loss: {avg_loss:.4f} | Val NDCG@10: {val_ndcg:.4f} | LR: {current_lr:.2e} | {elapsed:.1f}s")
 
         if use_mlflow:
-            mlflow.log_metrics({"train_loss": avg_loss, "val_ndcg10": val_ndcg}, step=epoch)
+            mlflow.log_metrics({"train_loss": avg_loss, "val_ndcg10": val_ndcg, "lr": current_lr}, step=epoch)
 
         stopper.step(val_ndcg, model)
         if stopper.should_stop:
