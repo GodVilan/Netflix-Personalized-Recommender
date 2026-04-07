@@ -6,6 +6,17 @@ Three recommendation models:
   3. TwoTowerRetrieval           – Dual-encoder with IN-BATCH negatives (Netflix architecture)
 
 Fix log (2026-04-07):
+  Fix-9  ALS: swapped user_factors / item_factors extraction from implicit model.
+    When fit() passes an items×users matrix to implicit, the library stores:
+      model.user_factors → item latent vectors  (shape: n_items × n_factors)
+      model.item_factors → user latent vectors  (shape: n_users × n_factors)
+    The previous code assigned them in the wrong order, causing:
+      IndexError: index 3706 is out of bounds for axis 0 with size 3706
+    when recommend() accessed self.user_factors[user_idx] for user_idx up to 6039
+    but the array only had 3706 rows (the item count).
+    Fix: self.user_factors = model.item_factors  (n_users × n_factors)
+         self.item_factors = model.user_factors  (n_items × n_factors)
+
   Fix-6  ALS: replaced custom numpy ALS with implicit.als.AlternatingLeastSquares.
     The custom O(n²) numpy loop needed ~8 min/iter; implicit uses Conjugate Gradient
     with optional CUDA support and converges in <30 s total. Published NDCG@10 on
@@ -54,6 +65,13 @@ class CollaborativeFilteringALS:
       - Published NDCG@10 on ML-1M: 0.075–0.090
 
     Reference: Hu et al., 2008 — Collaborative Filtering for Implicit Feedback.
+
+    IMPORTANT — implicit factor layout when fed an items×users matrix:
+      model.user_factors → item latent vectors  (shape: n_items × n_factors)
+      model.item_factors → user latent vectors  (shape: n_users × n_factors)
+    This is counter-intuitive but correct: implicit treats the rows of the
+    input matrix as "users" internally, so when we pass items×users, the
+    rows are items. Fix-9 assigns them correctly (see fit() below).
     """
 
     def __init__(
@@ -99,21 +117,17 @@ class CollaborativeFilteringALS:
             random_state     = self.random_state,
         )
 
-        # Progress callback every 5 iterations
-        _iter_count = [0]
-        def _progress(iteration, *_):
-            _iter_count[0] += 1
-            if _iter_count[0] % 5 == 0:
-                print(f"  ALS iteration {_iter_count[0]}/{self.iterations} complete")
-
         self.model.fit(weighted, show_progress=False)
         # Print completion markers for log compatibility
         for i in range(5, self.iterations + 1, 5):
             print(f"  ALS iteration {i}/{self.iterations} complete")
 
-        # Extract factors for downstream use (numpy float32)
-        self.user_factors = np.array(self.model.user_factors)
-        self.item_factors = np.array(self.model.item_factors)
+        # Fix-9: implicit was passed items×users, so internally:
+        #   model.user_factors has shape (n_items, n_factors)  ← item vectors
+        #   model.item_factors has shape (n_users, n_factors)  ← user vectors
+        # Assign them correctly so recommend() and similar_items() work.
+        self.user_factors = np.array(self.model.item_factors)  # (n_users, n_factors)
+        self.item_factors = np.array(self.model.user_factors)  # (n_items, n_factors)
         return self
 
     def recommend(self, user_idx: int, n: int = 10, exclude_seen: Optional[np.ndarray] = None) -> np.ndarray:
@@ -376,8 +390,8 @@ class TwoTowerRetrieval(nn.Module):
         if genre_feats is None:
             genre_feats = self.genre_matrix[pos_item]
 
-        user_vecs = self.encode_user(user)        # (B, d)
-        item_vecs = self.encode_item(pos_item, genre_feats)  # (B, d)
+        user_vecs = self.encode_user(user)                       # (B, d)
+        item_vecs = self.encode_item(pos_item, genre_feats)      # (B, d)
 
         if self.use_inbatch_negatives:
             # Logits matrix: user_vecs @ item_vecs.T  → (B, B)
