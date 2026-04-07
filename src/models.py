@@ -2,8 +2,34 @@
 models.py
 Three recommendation models:
   1. CollaborativeFilteringALS  – Matrix Factorization (Alternating Least Squares)
-  2. NeuralMatrixFactorization   – NCF-style deep model with BatchNorm (PyTorch)
+  2. NeuralMatrixFactorization   – NCF-style deep model (PyTorch)
   3. TwoTowerRetrieval           – Dual-encoder retrieval (PyTorch) — Netflix architecture
+
+Fixes applied (2026-04-06):
+  NCF Bug 1 — BatchNorm1d replaced with LayerNorm.
+    BatchNorm1d maintains running mean/var that are updated on every forward pass.
+    NCF's forward() called _score_pair twice per batch: once with B samples (pos)
+    and once with B×K samples (neg). The neg pass (B=2048, K=64 → 131k samples)
+    completely dominated the running stats. At eval time, BN used those corrupted
+    stats over n_items=3706 samples → near-identical output for every item →
+    effectively random ranking → NDCG@10 = 0.0.
+    LayerNorm normalises per sample with no running stats, works identically in
+    train and eval regardless of batch size.
+
+  NCF Bug 2 — Removed sigmoid from _score_pair.
+    Applying sigmoid before BPR loss squashes logits into (0, 1), making the
+    max pos−neg difference 1.0. logsigmoid(1.0) ≈ −0.31 and the gradient
+    through the outer sigmoid is at most 0.25, killing learning.
+    Raw logits are used for loss; sigmoid is applied only in score() if you need
+    a probability for logging.
+
+  NCF Bug 3 — Replaced BPR with InfoNCE (sampled softmax) + learned temperature.
+    BPR averages independent pairwise losses over 64 negatives per positive,
+    which does not exploit inter-negative structure. InfoNCE treats the K
+    negatives as a shared denominator, matching TwoTower's objective and making
+    full use of n_neg=64. Temperature τ is learned like TwoTower.
+    A single forward pass over (pos + neg) items replaces the two separate
+    _score_pair calls, eliminating the root cause of Bug 1 entirely.
 """
 
 import numpy as np
@@ -22,16 +48,15 @@ class CollaborativeFilteringALS:
     """
     Weighted ALS for implicit feedback.
     Reference: Hu et al., 2008 — Collaborative Filtering for Implicit Feedback Datasets.
-    Tuning notes for MovieLens-1M:
-      - alpha=1.0  (ratings are explicit stars binarized → low confidence weighting)
-      - iterations=30  (15 was too few; 30 improves NDCG ~15%)
-      - regularization=0.05  (slightly stronger regularization for 6k users)
+
+    Fix (2026-04-06): n_factors raised from 128 → 256 for richer latent space.
+    regularization tightened 0.05 → 0.01 to reduce underfitting on ML-1M.
     """
 
     def __init__(
         self,
-        n_factors: int = 128,
-        regularization: float = 0.05,
+        n_factors: int = 256,
+        regularization: float = 0.01,
         iterations: int = 30,
         alpha: float = 1.0,
         random_state: int = 42,
@@ -101,19 +126,20 @@ class CollaborativeFilteringALS:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. Neural Collaborative Filtering (NCF) with BatchNorm
+# 2. Neural Collaborative Filtering (NCF) — fixed
 # ─────────────────────────────────────────────────────────────────────────────
 
 class NeuralMatrixFactorization(nn.Module):
     """
-    GMF + MLP fusion with BatchNorm for stable training.
+    GMF + MLP fusion with LayerNorm and InfoNCE loss.
     Reference: He et al., 2017 — Neural Collaborative Filtering.
 
-    Key fixes vs. v1:
-      - BatchNorm after each MLP layer (prevents embedding collapse)
-      - Larger mf_dim (default 64) for richer latent space
-      - forward() accepts trainer's 5-arg call and computes BPR loss
-      - .score() API for inference
+    Changes from v1:
+      - BatchNorm1d → LayerNorm (Bug 1: eliminates running-stats corruption)
+      - Sigmoid removed from _score_pair (Bug 2: restores gradient magnitude)
+      - forward() computes pos + neg in a single pass (Bug 1 root cause)
+      - BPR loss → InfoNCE with learned temperature (Bug 3: matches TwoTower)
+      - score() still works for eval: returns raw logit (monotone for ranking)
     """
 
     def __init__(
@@ -135,19 +161,25 @@ class NeuralMatrixFactorization(nn.Module):
         self.user_emb_mlp = nn.Embedding(n_users, mlp_input_dim)
         self.item_emb_mlp = nn.Embedding(n_items, mlp_input_dim)
 
-        # MLP with BatchNorm — prevents embedding collapse on small datasets
+        # MLP with LayerNorm — no running stats, safe with any batch size / eval mode.
+        # Previously used BatchNorm1d which corrupted running stats when called with
+        # very different batch sizes (pos pass B=2048, neg pass B*K=131072).
         layers = []
         in_dim = mlp_dims[0]
         for out_dim in mlp_dims[1:]:
             layers.extend([
                 nn.Linear(in_dim, out_dim),
-                nn.BatchNorm1d(out_dim),
+                nn.LayerNorm(out_dim),   # ← was BatchNorm1d(out_dim)
                 nn.ReLU(),
                 nn.Dropout(dropout),
             ])
             in_dim = out_dim
         self.mlp = nn.Sequential(*layers)
         self.output_layer = nn.Linear(mf_dim + mlp_dims[-1], 1)
+
+        # Learned temperature for InfoNCE (same pattern as TwoTower).
+        self.log_temperature = nn.Parameter(torch.zeros(1))
+
         self._init_weights()
 
     def _init_weights(self):
@@ -160,14 +192,22 @@ class NeuralMatrixFactorization(nn.Module):
         nn.init.xavier_uniform_(self.output_layer.weight)
 
     def _score_pair(self, user: torch.Tensor, item: torch.Tensor) -> torch.Tensor:
-        gmf    = self.user_emb_gmf(user) * self.item_emb_gmf(item)
-        mlp_in = torch.cat([self.user_emb_mlp(user), self.item_emb_mlp(item)], dim=-1)
+        """
+        Raw logit for (user, item) pairs.
+        Bug 2 fix: sigmoid removed. Returning raw logits preserves gradient
+        magnitude for both BPR and InfoNCE losses.
+        """
+        gmf     = self.user_emb_gmf(user) * self.item_emb_gmf(item)
+        mlp_in  = torch.cat([self.user_emb_mlp(user), self.item_emb_mlp(item)], dim=-1)
         mlp_out = self.mlp(mlp_in)
-        out = self.output_layer(torch.cat([gmf, mlp_out], dim=-1))
-        return torch.sigmoid(out).squeeze(-1)
+        # Raw logit — no sigmoid here.
+        return self.output_layer(torch.cat([gmf, mlp_out], dim=-1)).squeeze(-1)
 
     def score(self, user: torch.Tensor, item: torch.Tensor) -> torch.Tensor:
-        """Inference API — called by evaluate_model."""
+        """
+        Inference API — called by evaluate_model to rank all items.
+        Returns raw logit (monotone transformation of probability, preserves rank order).
+        """
         return self._score_pair(user, item)
 
     def forward(
@@ -175,20 +215,42 @@ class NeuralMatrixFactorization(nn.Module):
         user: torch.Tensor,
         pos_item: torch.Tensor,
         neg_items: torch.Tensor,
-        pos_genre: Optional[torch.Tensor] = None,   # ignored by NCF
-        neg_genres: Optional[torch.Tensor] = None,  # ignored by NCF
+        pos_genre: Optional[torch.Tensor] = None,   # unused by NCF
+        neg_genres: Optional[torch.Tensor] = None,  # unused by NCF
     ) -> torch.Tensor:
-        """BPR loss over in-batch negatives. pos/neg shape: (B,) / (B, K)."""
-        pos_scores = self._score_pair(user, pos_item)          # (B,)
+        """
+        InfoNCE loss over (pos + neg) items in a SINGLE forward pass.
+
+        Bug 1 fix: stacking pos and neg into one tensor means _score_pair is
+        called exactly once with a uniform batch of B*(1+K) samples. LayerNorm
+        normalises each sample independently, so there are no running statistics
+        to corrupt.
+
+        Bug 3 fix: InfoNCE treats all K negatives jointly in the denominator,
+        exploiting inter-negative structure that BPR discards.
+        """
         B, K = neg_items.shape
-        user_exp = user.unsqueeze(1).expand(B, K).reshape(-1)
-        neg_scores = self._score_pair(user_exp, neg_items.reshape(-1)).view(B, K)  # (B,K)
-        loss = -F.logsigmoid(pos_scores.unsqueeze(1) - neg_scores).mean()
-        return loss
+
+        # Stack pos + neg along item axis: (B, 1+K)
+        all_items = torch.cat([pos_item.unsqueeze(1), neg_items], dim=1)      # (B, 1+K)
+        user_exp  = user.unsqueeze(1).expand(B, 1 + K).reshape(-1)            # (B*(1+K),)
+        items_flat = all_items.reshape(-1)                                      # (B*(1+K),)
+
+        # Single forward pass — LayerNorm handles any batch size correctly.
+        logits_flat = self._score_pair(user_exp, items_flat)                   # (B*(1+K),)
+        logits = logits_flat.view(B, 1 + K)                                    # (B, 1+K)
+
+        # Learned temperature (same clipping range as TwoTower).
+        temperature = self.log_temperature.exp().clamp(min=0.05, max=2.0)
+        logits = logits / temperature
+
+        # Cross-entropy: position 0 is always the positive item.
+        labels = torch.zeros(B, dtype=torch.long, device=user.device)
+        return F.cross_entropy(logits, labels)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. Two-Tower Retrieval Model (Netflix Architecture)
+# 3. Two-Tower Retrieval Model (Netflix Architecture) — unchanged
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TwoTowerRetrieval(nn.Module):
@@ -210,7 +272,7 @@ class TwoTowerRetrieval(nn.Module):
         embed_dim: int = 128,
         tower_dims: list = None,
         dropout: float = 0.1,
-        genre_features: Optional[np.ndarray] = None,  # (n_items, n_genres) for inference
+        genre_features: Optional[np.ndarray] = None,
     ):
         super().__init__()
         if tower_dims is None:
@@ -220,7 +282,6 @@ class TwoTowerRetrieval(nn.Module):
         self.n_genres  = n_genres
         self.embed_dim = embed_dim
 
-        # Register genre features as a non-trainable buffer for inference
         if genre_features is not None:
             self.register_buffer(
                 "genre_matrix",
@@ -232,7 +293,6 @@ class TwoTowerRetrieval(nn.Module):
                 torch.zeros(n_items, n_genres, dtype=torch.float32)
             )
 
-        # User tower
         self.user_embedding = nn.Embedding(n_users, embed_dim)
         user_in = embed_dim
         user_layers = []
@@ -244,7 +304,6 @@ class TwoTowerRetrieval(nn.Module):
         self.user_tower = nn.Sequential(*user_layers)
         self.user_proj  = nn.Linear(user_in, embed_dim)
 
-        # Item tower (ID emb + genre features)
         item_in = embed_dim + n_genres
         self.item_embedding = nn.Embedding(n_items, embed_dim)
         item_layers = []
@@ -277,14 +336,11 @@ class TwoTowerRetrieval(nn.Module):
         return F.normalize(self.item_proj(self.item_tower(x)), dim=-1)
 
     def score(self, user: torch.Tensor, item: torch.Tensor) -> torch.Tensor:
-        """
-        Inference API — uses REAL genre features from the registered buffer.
-        Eliminates the train/eval distribution shift that caused ~20% NDCG drop.
-        """
-        genre_feats = self.genre_matrix[item]          # (B, n_genres) — real features
-        user_vec    = self.encode_user(user)            # (B, D)
-        item_vec    = self.encode_item(item, genre_feats)  # (B, D)
-        return (user_vec * item_vec).sum(dim=-1)        # (B,)
+        """Inference API — uses REAL genre features from the registered buffer."""
+        genre_feats = self.genre_matrix[item]
+        user_vec    = self.encode_user(user)
+        item_vec    = self.encode_item(item, genre_feats)
+        return (user_vec * item_vec).sum(dim=-1)
 
     def forward(
         self,
@@ -294,7 +350,6 @@ class TwoTowerRetrieval(nn.Module):
         genre_feats: Optional[torch.Tensor] = None,
         neg_genre_feats: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """InfoNCE loss. Falls back to buffer genre features if not provided."""
         device = user.device
         B  = user.shape[0]
         K  = neg_items.shape[1]
