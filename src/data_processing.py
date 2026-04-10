@@ -1,5 +1,5 @@
 """
-data_processing.py  —  DARE-Rec rewrite (2026-04-10)
+data_processing.py  —  DARE-Rec rewrite (2026-04-10, audit-fixed 2026-04-10)
 
 Split protocol: 80/20 random holdout per user (stratified).
 Matches Anelli et al. 2022 (UMAP) — the definitive ML-1M benchmark paper.
@@ -57,7 +57,6 @@ def build_temporal_interaction_matrix(
     decay=0.001 per day (timestamp in seconds → convert to days).
     """
     t_max = ratings["timestamp"].max()
-    # ML-1M timestamps are Unix seconds; convert delta to days
     days_ago = (t_max - ratings["timestamp"]) / 86400.0
     weights  = np.exp(-decay * days_ago).astype(np.float32)
     row = ratings["user_idx"].values
@@ -73,6 +72,11 @@ def split_data_holdout(ratings: pd.DataFrame, test_ratio: float = 0.2, seed: int
 
     Guarantees each user has at least 1 item in train, val, and test.
     Users with < 5 ratings are placed entirely in train.
+
+    FIX (audit): rng.shuffle() on a plain Python list is supported in numpy
+    ≥1.23 but the behaviour is implementation-defined for lists (it converts
+    internally). Using rng.permutation(len(idx)) and indexing is unambiguous
+    and works across all numpy versions from 1.17+.
     """
     rng = np.random.default_rng(seed)
     train_rows, val_rows, test_rows = [], [], []
@@ -82,7 +86,10 @@ def split_data_holdout(ratings: pd.DataFrame, test_ratio: float = 0.2, seed: int
         if len(idx) < 5:
             train_rows.extend(idx)
             continue
-        rng.shuffle(idx)
+        # version-safe shuffle via permutation
+        perm = rng.permutation(len(idx))
+        idx  = [idx[i] for i in perm]
+
         n_test = max(1, int(len(idx) * test_ratio))
         n_val  = max(1, int((len(idx) - n_test) * test_ratio))
         test_rows.extend(idx[:n_test])

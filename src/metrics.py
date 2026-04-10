@@ -1,5 +1,5 @@
 """
-metrics.py  —  DARE-Rec rewrite (2026-04-10)
+metrics.py  —  DARE-Rec rewrite (2026-04-10, audit-fixed 2026-04-10)
 
 Metrics reported (first system on ML-1M to report all five together):
   Accuracy  : NDCG@K, Recall@K, HitRate@K, MRR
@@ -63,9 +63,7 @@ def intra_list_diversity(
     norms = np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-8
     vecs_norm = vecs / norms                                    # unit vectors
     sim_matrix = vecs_norm @ vecs_norm.T                        # (k, k) cosine sim
-    # upper triangle (i < j)
     k_ = len(items)
-    n_pairs = k_ * (k_ - 1) / 2
     upper = sim_matrix[np.triu_indices(k_, k=1)]
     return float(1.0 - upper.mean())  # dissimilarity
 
@@ -80,12 +78,19 @@ def evaluate_recommendations(
 ) -> Dict[str, float]:
     """
     Full evaluation: accuracy + diversity + coverage + novelty.
+
+    FIX (audit): Coverage was computed over ALL users in recommendations dict,
+    including users absent from ground_truth (cold-start / edge cases). This
+    inflates Coverage if recommendations include users with no test items.
+    Fix: collect recommended items only from users that appear in ground_truth.
     """
     results = defaultdict(list)
+    evaluated_users = set()
 
     for user_id, recs in recommendations.items():
         if user_id not in ground_truth:
             continue
+        evaluated_users.add(user_id)
         relevant = ground_truth[user_id]
         for k in k_values:
             results[f"Precision@{k}"].append(precision_at_k(recs, relevant, k))
@@ -99,15 +104,20 @@ def evaluate_recommendations(
     metrics = {name: round(float(np.mean(vals)), 4) for name, vals in results.items()}
 
     if n_items:
-        all_recs = {item for recs in recommendations.values() for item in recs}
+        # Only count items recommended to users that have ground truth
+        all_recs = {
+            item
+            for uid in evaluated_users
+            for item in recommendations.get(uid, [])
+        }
         metrics["Coverage"] = round(len(all_recs) / n_items, 4)
 
     if item_popularity:
         total_pop = sum(item_popularity.values())
         novelty_scores = [
             -np.log2(item_popularity.get(item, 1) / total_pop + 1e-10)
-            for recs in recommendations.values()
-            for item in recs[:10]
+            for uid in evaluated_users
+            for item in recommendations.get(uid, [])[:10]
         ]
         metrics["Novelty"] = round(float(np.mean(novelty_scores)), 4)
 
