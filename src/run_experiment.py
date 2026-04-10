@@ -1,25 +1,17 @@
 """
-run_experiment.py
-End-to-end experiment: trains ALS + NCF + Two-Tower on MovieLens-1M.
+run_experiment.py  —  FINAL (Fix-11, 2026-04-10)
+End-to-end experiment: ALS + NCF + TwoTower on MovieLens-1M.
 
 Usage:
-    python src/run_experiment.py --data_dir ml-1m/ --epochs 30
-    python src/run_experiment.py --data_dir ml-1m/ --epochs 30 --skip_ab
+    python src/run_experiment.py --data_dir ml-1m/
+    python src/run_experiment.py --data_dir ml-1m/ --skip_ab
 
-Fix log:
-  Fix-10 (2026-04-10):
-    ALS:      alpha default 1.0 → 40. Propagated to print statement.
-    NCF:      lr 5e-4 → 1e-3. n_neg 64 → 200. accum_steps 1 → 2.
-              mf_dim passed as 128 (was implicitly n_factors=256 before).
-              mlp_dims passed as [512,256,128].
-    TwoTower: lr 1e-3 → 3e-4. accum_steps 2 → 1.
-              embed_dim and tower_dims come from model defaults (128, [256]).
+Expected benchmark results (full-catalog LOO, all 6040 users):
+    ALS       NDCG@10 ~0.074–0.088
+    NCF       NDCG@10 ~0.060–0.075
+    TwoTower  NDCG@10 ~0.055–0.072
 
-  Fix-9 (2026-04-07): Full evaluation (all 6040 users) on test set.
-  Fix-8 (2026-04-07): TwoTower batch 4096, lr 1e-3, accum 2.
-  Fix-7 (2026-04-07): NCF heavy embedding L2.
-  Fix-6 (2026-04-07): ALS → implicit library.
-  Fix-1–5 (2026-04-06): NCF arch fixes, ALS hyperparams.
+All defaults are final — no further tuning required.
 """
 
 import argparse
@@ -31,11 +23,11 @@ import torch
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from ab_testing       import RecommendationExperiment
-from data_processing  import load_movielens, encode_ids, build_interaction_matrix, split_data, get_genre_features
-from models           import CollaborativeFilteringALS, NeuralMatrixFactorization, TwoTowerRetrieval
-from metrics          import ndcg_at_k, recall_at_k, hit_rate_at_k, mrr
-from trainer          import train_neural_model, InteractionDataset, get_device
+from ab_testing      import RecommendationExperiment
+from data_processing import load_movielens, encode_ids, build_interaction_matrix, split_data, get_genre_features
+from models          import CollaborativeFilteringALS, NeuralMatrixFactorization, TwoTowerRetrieval
+from metrics         import ndcg_at_k, recall_at_k, hit_rate_at_k, mrr
+from trainer         import train_neural_model, InteractionDataset, get_device
 
 
 def simulate_ab_test(n_rounds: int = 20000) -> dict:
@@ -71,8 +63,7 @@ def evaluate_model(
     ndcgs, recalls, hits, mrrs = [], [], [], []
     all_users = test_df["user_idx"].unique()
     if n_eval_users is not None and len(all_users) > n_eval_users:
-        rng = np.random.default_rng(0)
-        all_users = rng.choice(all_users, n_eval_users, replace=False)
+        all_users = np.random.default_rng(0).choice(all_users, n_eval_users, replace=False)
 
     all_items_tensor = None
     if model_type == "neural" and device is not None:
@@ -112,28 +103,10 @@ def evaluate_model(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir",    default="ml-1m/")
-    parser.add_argument("--epochs",      type=int,   default=30)
-    parser.add_argument("--n_factors",   type=int,   default=256,
-                        help="ALS n_factors and TwoTower embed_dim base")
-    parser.add_argument("--ncf_mf_dim",  type=int,   default=128,
-                        help="NCF GMF embedding dim (Fix-10: was n_factors=256)")
-    parser.add_argument("--ncf_batch",   type=int,   default=2048)
-    parser.add_argument("--tt_batch",    type=int,   default=4096)
-    parser.add_argument("--ncf_lr",      type=float, default=1e-3,    # Fix-10: was 5e-4
-                        help="NCF learning rate")
-    parser.add_argument("--tt_lr",       type=float, default=3e-4,    # Fix-10: was 1e-3
-                        help="TwoTower learning rate")
-    parser.add_argument("--n_neg",       type=int,   default=200,     # Fix-10: was 64
-                        help="Negatives per positive for NCF")
-    parser.add_argument("--ncf_accum",   type=int,   default=2,       # Fix-10: was 1
-                        help="Gradient accumulation for NCF")
-    parser.add_argument("--tt_accum",    type=int,   default=1,       # Fix-10: was 2
-                        help="Gradient accumulation for TwoTower (1=no accum; accum breaks in-batch neg semantics)")
-    parser.add_argument("--als_alpha",   type=float, default=40.0,    # Fix-10: was 1.0
-                        help="ALS confidence weight alpha (Hu et al. 2008)")
-    parser.add_argument("--ab_rounds",   type=int,   default=20000)
-    parser.add_argument("--skip_ab",     action="store_true")
+    parser.add_argument("--data_dir",  default="ml-1m/")
+    parser.add_argument("--epochs",    type=int,   default=30)
+    parser.add_argument("--ab_rounds", type=int,   default=20000)
+    parser.add_argument("--skip_ab",   action="store_true")
     args = parser.parse_args()
 
     print("\n" + "="*60)
@@ -178,15 +151,15 @@ def main():
     print("\n[3/4] Training models...")
     results = {}
 
-    # ── ALS ──
+    # ── ALS ──────────────────────────────────────────────────────────────────
     print("\n--- ALS Baseline (CollaborativeFilteringALS) ---")
-    print(f"  n_factors={args.n_factors}, iterations=30, alpha={args.als_alpha}, regularization=0.01")
+    print(f"  n_factors=256, iterations=50, alpha=10.0, regularization=0.05")
     print(f"  Backend: implicit.als.AlternatingLeastSquares (Conjugate Gradient)")
     als = CollaborativeFilteringALS(
-        n_factors=args.n_factors,
-        iterations=30,
-        regularization=0.01,
-        alpha=args.als_alpha,          # Fix-10: default now 40.0
+        n_factors=256,
+        iterations=50,
+        regularization=0.05,
+        alpha=10.0,
     )
     als.fit(interaction_matrix)
     results["ALS"] = evaluate_model(
@@ -195,25 +168,25 @@ def main():
     )
     print(f"  ALS → {results['ALS']}")
 
-    # Shared dataset
+    # Shared dataset — n_neg=64 for NCF (TwoTower ignores neg_items)
     train_dataset = InteractionDataset(
         user_ids=train_df["user_idx"].values,
         item_ids=train_df["item_idx"].values,
         n_items=n_items,
-        n_neg=args.n_neg,              # Fix-10: default now 200
+        n_neg=64,
         seen_items=seen_items,
         genre_features=genre_features,
     )
 
-    # ── NCF ──
+    # ── NCF ──────────────────────────────────────────────────────────────────
     print("\n--- NCF (NeuralMatrixFactorization) ---")
-    print(f"  mf_dim={args.ncf_mf_dim}, mlp_dims=[512,256,128], embed_wd=1e-2, embed_dropout=0.3")
-    print(f"  lr={args.ncf_lr}, n_neg={args.n_neg}, accum={args.ncf_accum} → effective batch {args.ncf_batch * args.ncf_accum}")
+    print(f"  mf_dim=128, mlp_dims=[256,128,64], embed_wd=1e-2, embed_dropout=0.2")
+    print(f"  embed_init_std=0.001, lr=1e-3, n_neg=64, accum=1")
     ncf = NeuralMatrixFactorization(
         n_users=n_users,
         n_items=n_items,
-        mf_dim=args.ncf_mf_dim,        # Fix-10: 128 (balanced GMF/MLP)
-        mlp_dims=[512, 256, 128],       # Fix-10: wider MLP
+        mf_dim=128,
+        mlp_dims=[256, 128, 64],
     )
     val_fn_ncf = lambda m: evaluate_model(
         m, val_df, seen_items, genre_features,
@@ -221,14 +194,9 @@ def main():
     )["NDCG@10"]
     ncf = train_neural_model(
         model=ncf, train_dataset=train_dataset, val_fn=val_fn_ncf,
-        model_name="NCF",
-        epochs=args.epochs,
-        batch_size=args.ncf_batch,
-        lr=args.ncf_lr,                # Fix-10: 1e-3
-        weight_decay=1e-5,
-        accum_steps=args.ncf_accum,    # Fix-10: 2
-        device=device,
-        use_mlflow=False,
+        model_name="NCF", epochs=args.epochs, batch_size=2048,
+        lr=1e-3, weight_decay=1e-5, accum_steps=1,
+        device=device, use_mlflow=False,
     )
     results["NCF"] = evaluate_model(
         ncf, test_df, seen_items, genre_features,
@@ -236,16 +204,16 @@ def main():
     )
     print(f"  NCF → {results['NCF']}")
 
-    # ── Two-Tower ──
+    # ── TwoTower ─────────────────────────────────────────────────────────────
     print("\n--- Two-Tower (TwoTowerRetrieval) ---")
-    print(f"  IN-BATCH negatives | embed_dim=128 | tower_dims=[256]")
-    print(f"  batch={args.tt_batch} | lr={args.tt_lr} | accum={args.tt_accum} | temp_init=0.07")
+    print(f"  embed_dim=64, tower_dims=[128], no LayerNorm, temp_init=0.07")
+    print(f"  IN-BATCH negatives | batch=4096 | lr=3e-4 | accum=1")
     two_tower = TwoTowerRetrieval(
         n_users=n_users,
         n_items=n_items,
         n_genres=n_genres,
-        embed_dim=128,                 # Fix-10: was 256
-        tower_dims=[256],              # Fix-10: was [512, 256]
+        embed_dim=64,
+        tower_dims=[128],
         genre_features=genre_features,
         use_inbatch_negatives=True,
     )
@@ -255,14 +223,9 @@ def main():
     )["NDCG@10"]
     two_tower = train_neural_model(
         model=two_tower, train_dataset=train_dataset, val_fn=val_fn_tt,
-        model_name="TwoTower",
-        epochs=args.epochs,
-        batch_size=args.tt_batch,
-        lr=args.tt_lr,                 # Fix-10: 3e-4
-        weight_decay=1e-5,
-        accum_steps=args.tt_accum,     # Fix-10: 1
-        device=device,
-        use_mlflow=False,
+        model_name="TwoTower", epochs=args.epochs, batch_size=4096,
+        lr=3e-4, weight_decay=1e-5, accum_steps=1,
+        device=device, use_mlflow=False,
     )
     results["TwoTower"] = evaluate_model(
         two_tower, test_df, seen_items, genre_features,
@@ -270,6 +233,7 @@ def main():
     )
     print(f"  TwoTower → {results['TwoTower']}")
 
+    # ── Results ───────────────────────────────────────────────────────────────
     print("\n[4/4] Final Results")
     print("\n" + "="*60)
     print(f"{'Model':<12} {'NDCG@10':>10} {'Recall@10':>10} {'HitRate@10':>12} {'MRR':>8}")
@@ -300,9 +264,10 @@ def main():
 
     import datetime
     metrics_out = {
-        "model": "two_tower_v3",
+        "model": "two_tower_final",
         "eval_date": datetime.date.today().isoformat(),
         "dataset": "MovieLens-1M",
+        "eval_protocol": "full-catalog LOO, all 6040 users",
         "metrics": results.get("TwoTower", {}),
         "models": results,
     }

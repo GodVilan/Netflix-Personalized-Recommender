@@ -1,27 +1,15 @@
 """
-trainer.py
-Training loop for PyTorch-based recommendation models (NCF & TwoTower).
+trainer.py  —  FINAL (Fix-11, 2026-04-10)
+Training loop for NCF and TwoTower.
 
-Fix log (2026-04-07):
-  Fix-7  NCF: optimizer now uses get_param_groups() when available, giving
-    heavy L2 (weight_decay=1e-2) on embedding parameters and light L2 (1e-5)
-    on MLP/projection weights. Previously weight_decay=1e-5 was applied
-    uniformly, allowing embedding memorisation.
+Changes from Fix-11:
+  patience  7  → 10   (models need more epochs to converge)
+  min_delta 1e-4 → 5e-5 (finer early-stopping resolution)
+  num_workers 2 → 4   (reduces data-loading bottleneck on A100)
 
-  Fix-8  TwoTower: default batch_size raised 2048 → 4096.
-    In-batch negatives scale as O(B): 4096 batch → 4095 negatives vs 2048 → 2047.
-    For the A100-SXM4-80GB this is well within memory budget.
-    TwoTower LR raised to 1e-3 (from 5e-4) since in-batch neg gradients are
-    richer and the model can absorb larger updates.
-
-  Fix-9  Gradient accumulation (accum_steps=2) doubles the effective batch size
-    to 8192 for TwoTower without extra GPU memory.
-
-Previous fixes (2026-04-06):
-  Fixed torch.cuda.amp.GradScaler deprecation → torch.amp.GradScaler
-  n_neg raised 4 → 64
-  WarmupCosineScheduler replaces CosineAnnealingWarmRestarts
-  Patience raised 5 → 7
+All previous fixes retained:
+  Fix-7: get_param_groups() for NCF (heavy embed L2)
+  Fix-8/9: AMP, WarmupCosine, gradient accumulation
 """
 
 import time
@@ -34,7 +22,6 @@ import mlflow
 import mlflow.pytorch
 
 
-# ── Device Selection ─────────────────────────────────────────────────────────
 def get_device() -> torch.device:
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -52,15 +39,11 @@ def get_device() -> torch.device:
     return device
 
 
-# ── Dataset ──────────────────────────────────────────────────────────────────
 class InteractionDataset(Dataset):
     """
-    Positive interactions + sampled negatives.
-    NOTE: TwoTower in-batch-negative mode ignores neg_items at train time;
-    they are still sampled here for NCF compatibility and the fallback path.
-    n_neg=64 kept for NCF; TwoTower uses in-batch negatives instead.
+    Positive interactions + sampled negatives for NCF.
+    TwoTower ignores neg_items (uses in-batch negatives instead).
     """
-
     def __init__(
         self,
         user_ids: np.ndarray,
@@ -97,10 +80,9 @@ class InteractionDataset(Dataset):
         user     = int(self.users[idx])
         pos_item = int(self.items[idx])
         neg_items = self._sample_negatives(user)
-
         sample = {
-            "user":      torch.tensor(user,     dtype=torch.long),
-            "pos_item":  torch.tensor(pos_item, dtype=torch.long),
+            "user":      torch.tensor(user,      dtype=torch.long),
+            "pos_item":  torch.tensor(pos_item,  dtype=torch.long),
             "neg_items": torch.tensor(neg_items, dtype=torch.long),
         }
         if self.genre_features is not None:
@@ -109,10 +91,8 @@ class InteractionDataset(Dataset):
         return sample
 
 
-# ── LR Scheduler ─────────────────────────────────────────────────────────────
 class WarmupCosineScheduler:
     """Linear warmup + cosine decay."""
-
     def __init__(self, optimizer, warmup_epochs: int, total_epochs: int, min_lr: float = 1e-6):
         self.optimizer     = optimizer
         self.warmup_epochs = warmup_epochs
@@ -127,14 +107,12 @@ class WarmupCosineScheduler:
             progress = (epoch - self.warmup_epochs) / max(self.total_epochs - self.warmup_epochs, 1)
             scale    = 0.5 * (1.0 + np.cos(np.pi * progress))
             scale    = self.min_lr / self.base_lrs[0] + scale * (1.0 - self.min_lr / self.base_lrs[0])
-
         for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
             pg["lr"] = base_lr * scale
 
 
-# ── Early Stopping ────────────────────────────────────────────────────────────
 class EarlyStopping:
-    def __init__(self, patience: int = 7, min_delta: float = 1e-4):
+    def __init__(self, patience: int = 10, min_delta: float = 5e-5):  # Fix-11
         self.patience    = patience
         self.min_delta   = min_delta
         self.best_score  = -np.inf
@@ -157,7 +135,6 @@ class EarlyStopping:
             model.load_state_dict(self.best_state)
 
 
-# ── Training Loop ─────────────────────────────────────────────────────────────
 def train_neural_model(
     model: nn.Module,
     train_dataset: InteractionDataset,
@@ -168,29 +145,21 @@ def train_neural_model(
     lr: float = 5e-4,
     weight_decay: float = 1e-5,
     warmup_epochs: int = 2,
-    patience: int = 7,
+    patience: int = 10,       # Fix-11: was 7
     accum_steps: int = 1,
     device: Optional[torch.device] = None,
     use_mlflow: bool = True,
 ) -> nn.Module:
-    """
-    accum_steps: gradient accumulation steps.
-      Effective batch = batch_size × accum_steps.
-      For TwoTower with in-batch negatives, set accum_steps=2 and batch_size=4096
-      → effective 8192 negatives per positive.
-    """
     if device is None:
         device = get_device()
     else:
         device = torch.device(device)
 
     model = model.to(device)
-
     use_amp_cuda = (device.type == "cuda")
     use_amp_mps  = (device.type == "mps")
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp_cuda)
 
-    # Fix-7: use get_param_groups() if the model exposes it (NCF)
     if hasattr(model, "get_param_groups"):
         param_groups = model.get_param_groups(lr=lr, embed_wd=1e-2, mlp_wd=weight_decay)
     else:
@@ -201,14 +170,12 @@ def train_neural_model(
 
     loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
-        num_workers=2, pin_memory=use_amp_cuda, drop_last=True,
-        # drop_last=True ensures all batches have the same size,
-        # which matters for in-batch negative correctness.
+        num_workers=4, pin_memory=use_amp_cuda, drop_last=True,  # Fix-11: num_workers 2→4
     )
 
     stopper = EarlyStopping(patience=patience)
-
     eff_batch = batch_size * accum_steps
+
     if use_mlflow:
         mlflow.start_run(run_name=model_name)
         mlflow.log_params({
@@ -258,7 +225,7 @@ def train_neural_model(
                 )
                 (loss / accum_steps).backward()
 
-            epoch_loss += loss.item() * accum_steps  # un-scale for logging
+            epoch_loss += loss.item() * accum_steps
 
             if (step + 1) % accum_steps == 0 or (step + 1) == len(loader):
                 if use_amp_cuda:
