@@ -1,5 +1,5 @@
 """
-api/main.py  —  DARE-Rec FastAPI serving layer (2026-04-10)
+api/main.py  —  DARE-Rec FastAPI serving layer (2026-04-10, v3)
 
 Endpoints:
   GET  /recommend/{user_id}  — top-K personalized recommendations
@@ -20,12 +20,17 @@ Checkpoints expected (all written by src/run_experiment.py):
   checkpoints/ials_factors.npz        — iALS user/item factors
   checkpoints/ensemble_weights.json   — DAREnsemble alpha/beta/gamma
   checkpoints/genre_matrix.npy        — (n_items, n_genres) float32
-  checkpoints/item_metadata.json      — {item_idx: title} (optional)
+  checkpoints/item_metadata.json      — {item_idx: title}  <— real movie titles
+  checkpoints/scores_ease.npy         — (n_users, n_items) precomputed EASE scores
+  checkpoints/scores_ials.npy         — (n_users, n_items) precomputed iALS scores
+  checkpoints/scores_lgcn.npy         — (n_users, n_items) precomputed LightGCN scores
+  checkpoints/scores_dare.npy         — (n_users, n_items) precomputed DARE ensemble scores
 
-Fix (2026-04-10):
-  Previous version looked for two_tower.pt and als_factors.npz which were never
-  written by run_experiment.py, causing permanent 503s on every /recommend call.
-  This version aligns checkpoint names exactly with what run_experiment.py saves.
+v3 fix (2026-04-10):
+  Previous version stored no training matrix, so _score_ease() always returned
+  zeros for online DARE blending. This version loads full precomputed score matrices
+  at startup — recommend() just reads the correct row, sub-millisecond latency.
+  item_metadata now verified with a startup log sample so titles are confirmed loaded.
 """
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -46,7 +51,7 @@ logger = logging.getLogger("dare-rec-api")
 app = FastAPI(
     title="DARE-Rec Recommendation API",
     description="TemporalEASE + LightGCN + iALS ensemble recommendation engine",
-    version="2.0.0",
+    version="3.0.0",
 )
 
 app.add_middleware(
@@ -80,50 +85,44 @@ class SimilarItemsResponse(BaseModel):
 # ── Constants ───────────────────────────────────────────────────────────
 
 CHECKPOINT_DIR = os.environ.get("CHECKPOINT_DIR", "checkpoints")
-N_ITEMS  = 3706
-N_USERS  = 6040
-EMBED_DIM = 64    # must match --lgcn_dim used during training (default 64)
-N_LAYERS  = 3     # must match --lgcn_layers used during training (default 3)
-N_GENRES  = 18
+N_ITEMS   = 3706
+N_USERS   = 6040
+EMBED_DIM = 64
+N_LAYERS  = 3
 
 # ── ModelStore ──────────────────────────────────────────────────────────
 
 class ModelStore:
     """
     Loads DARE-Rec checkpoints at startup.
-    Each model degrades gracefully: missing checkpoint → 503 for that model only.
 
-    Checkpoint ↔ model mapping (must match run_experiment.py save paths):
-      ease_B.npz            → self.ease_B         (n_items, n_items)
-      lightgcn.pt           → self.lgcn           LightGCN state dict
-      ials_factors.npz      → self.ials_U / _V    (n_users, f), (n_items, f)
-      ensemble_weights.json → self.alpha/beta/gamma
-      genre_matrix.npy      → self.genre_matrix   (n_items, n_genres)
-      item_metadata.json    → self.item_metadata  {idx: title}
+    Priority for scoring:
+      1. Precomputed score matrices (scores_*.npy) — exact offline scores, fastest
+      2. Live recompute from model weights — used only if score matrices missing
     """
 
     def __init__(self):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # TemporalEASE
-        self.ease_B: Optional[np.ndarray] = None            # (n_items, n_items)
+        # Precomputed score matrices (n_users, n_items) — loaded if available
+        self.S_ease: Optional[np.ndarray] = None
+        self.S_ials: Optional[np.ndarray] = None
+        self.S_lgcn: Optional[np.ndarray] = None
+        self.S_dare: Optional[np.ndarray] = None
 
-        # LightGCN
-        self.lgcn = None
-        self.lgcn_item_emb: Optional[torch.Tensor] = None  # (n_items, D) precomputed
-        self.lgcn_user_emb: Optional[torch.Tensor] = None  # (n_users, D) precomputed
-
-        # iALS
-        self.ials_U: Optional[np.ndarray] = None            # (n_users, f)
-        self.ials_V: Optional[np.ndarray] = None            # (n_items, f)
+        # Live fallback: model weights
+        self.ease_B: Optional[np.ndarray] = None
+        self.lgcn_user_emb: Optional[torch.Tensor] = None
+        self.lgcn_item_emb: Optional[torch.Tensor] = None
+        self.ials_U: Optional[np.ndarray] = None
+        self.ials_V: Optional[np.ndarray] = None
 
         # Ensemble weights
-        self.alpha: float = 1.0   # default: EASE only until weights file loads
-        self.beta:  float = 0.0
-        self.gamma: float = 0.0
+        self.alpha: float = 0.9
+        self.beta:  float = 0.05
+        self.gamma: float = 0.05
 
-        # Shared
-        self.genre_matrix: Optional[np.ndarray] = None
+        # Metadata
         self.item_metadata: dict = {}
 
         self._load_all()
@@ -132,26 +131,39 @@ class ModelStore:
         return os.path.join(CHECKPOINT_DIR, filename)
 
     def _load_all(self):
-        # Must add src/ to path so models.py is importable
         src_dir = os.path.join(os.path.dirname(__file__), "..", "src")
         if src_dir not in sys.path:
             sys.path.insert(0, os.path.abspath(src_dir))
 
-        # genre matrix (needed for LightGCN graph rebuild)
-        gm_path = self._p("genre_matrix.npy")
-        if os.path.exists(gm_path):
-            self.genre_matrix = np.load(gm_path).astype(np.float32)
-            logger.info(f"Genre matrix loaded: {self.genre_matrix.shape}")
-
-        # item metadata
+        # ── item metadata (real movie titles) ──────────────────────────
         meta_path = self._p("item_metadata.json")
         if os.path.exists(meta_path):
             with open(meta_path) as f:
-                self.item_metadata = {int(k): v for k, v in json.load(f).items()}
+                raw = json.load(f)
+            # Keys are saved as strings by json.dump — convert to int
+            self.item_metadata = {int(k): v for k, v in raw.items()}
+            sample = {k: self.item_metadata[k] for k in list(self.item_metadata)[:3]}
+            logger.info(f"item_metadata loaded: {len(self.item_metadata)} titles. Sample: {sample}")
         else:
             self.item_metadata = {i: f"Movie {i}" for i in range(N_ITEMS)}
+            logger.warning(f"item_metadata.json not found at {meta_path} — using placeholder titles. Run training first.")
 
-        # TemporalEASE B matrix
+        # ── precomputed score matrices (preferred) ──────────────────────
+        for attr, fname in [
+            ("S_ease", "scores_ease.npy"),
+            ("S_ials", "scores_ials.npy"),
+            ("S_lgcn", "scores_lgcn.npy"),
+            ("S_dare", "scores_dare.npy"),
+        ]:
+            path = self._p(fname)
+            if os.path.exists(path):
+                mat = np.load(path)
+                setattr(self, attr, mat.astype(np.float32))
+                logger.info(f"Loaded {fname}: {mat.shape}")
+            else:
+                logger.info(f"{fname} not found — will use live recompute fallback.")
+
+        # ── live fallback: TemporalEASE B matrix ───────────────────────
         ease_path = self._p("ease_B.npz")
         if os.path.exists(ease_path):
             try:
@@ -160,143 +172,145 @@ class ModelStore:
             except Exception as e:
                 logger.warning(f"Could not load TemporalEASE: {e}")
         else:
-            logger.warning(f"TemporalEASE checkpoint not found at {ease_path}. Run training first.")
+            logger.warning(f"ease_B.npz not found at {ease_path}.")
 
-        # iALS factors
+        # ── live fallback: iALS factors ────────────────────────────────
         ials_path = self._p("ials_factors.npz")
         if os.path.exists(ials_path):
             try:
                 data = np.load(ials_path)
-                self.ials_U = data["user_factors"].astype(np.float32)  # (n_users, f)
-                self.ials_V = data["item_factors"].astype(np.float32)  # (n_items, f)
+                self.ials_U = data["user_factors"].astype(np.float32)
+                self.ials_V = data["item_factors"].astype(np.float32)
                 logger.info(f"iALS factors loaded: U={self.ials_U.shape}, V={self.ials_V.shape}")
             except Exception as e:
-                logger.warning(f"Could not load iALS factors: {e}")
+                logger.warning(f"Could not load iALS: {e}")
         else:
-            logger.warning(f"iALS factors not found at {ials_path}. Run training first.")
+            logger.warning(f"ials_factors.npz not found at {ials_path}.")
 
-        # LightGCN
+        # ── live fallback: LightGCN embeddings ────────────────────────
         lgcn_path = self._p("lightgcn.pt")
         if os.path.exists(lgcn_path):
             try:
                 from models import LightGCN
-                self.lgcn = LightGCN(
-                    n_users=N_USERS, n_items=N_ITEMS,
-                    embed_dim=EMBED_DIM, n_layers=N_LAYERS,
-                )
+                lgcn = LightGCN(n_users=N_USERS, n_items=N_ITEMS,
+                                embed_dim=EMBED_DIM, n_layers=N_LAYERS)
                 state = torch.load(lgcn_path, map_location=self.device, weights_only=True)
-                self.lgcn.load_state_dict(state)
-                self.lgcn.eval().to(self.device)
-
-                # Precompute user + item embeddings (no graph needed for inference
-                # because norm_adj is not saved — we do a parameter-only forward pass
-                # using the final layer-0 embeddings as a fast approximation)
+                lgcn.load_state_dict(state)
+                lgcn.eval()
                 with torch.no_grad():
-                    self.lgcn_user_emb = self.lgcn.user_embedding.weight.cpu()  # (n_users, D)
-                    self.lgcn_item_emb = self.lgcn.item_embedding.weight.cpu()  # (n_items, D)
+                    self.lgcn_user_emb = lgcn.user_embedding.weight.cpu()
+                    self.lgcn_item_emb = lgcn.item_embedding.weight.cpu()
                 logger.info("LightGCN checkpoint loaded; embeddings precomputed.")
             except Exception as e:
                 logger.warning(f"Could not load LightGCN: {e}")
-                self.lgcn = None
         else:
-            logger.warning(f"LightGCN checkpoint not found at {lgcn_path}. Run training first.")
+            logger.warning(f"lightgcn.pt not found at {lgcn_path}.")
 
-        # Ensemble weights
+        # ── ensemble weights ───────────────────────────────────────────
         ew_path = self._p("ensemble_weights.json")
         if os.path.exists(ew_path):
             try:
                 with open(ew_path) as f:
                     ew = json.load(f)
-                self.alpha = float(ew.get("alpha", 1.0))
-                self.beta  = float(ew.get("beta",  0.0))
-                self.gamma = float(ew.get("gamma", 0.0))
+                self.alpha = float(ew.get("alpha", 0.9))
+                self.beta  = float(ew.get("beta",  0.05))
+                self.gamma = float(ew.get("gamma", 0.05))
                 logger.info(f"Ensemble weights: α={self.alpha} β={self.beta} γ={self.gamma}")
             except Exception as e:
                 logger.warning(f"Could not load ensemble weights: {e}")
-        else:
-            logger.warning(f"Ensemble weights not found at {ew_path}. Defaulting to EASE-only.")
 
-    # ── readiness ─────────────────────────────────────────────────
+    # ── readiness ──────────────────────────────────────────────────
 
     def is_ready(self, model: str) -> bool:
-        if model == "ease":  return self.ease_B is not None
-        if model == "lgcn":  return self.lgcn_item_emb is not None
-        if model == "ials":  return self.ials_U is not None
-        if model == "dare":  return self.ease_B is not None  # EASE dominates (alpha=0.90)
+        if model == "ease":
+            return self.S_ease is not None or self.ease_B is not None
+        if model == "lgcn":
+            return self.S_lgcn is not None or self.lgcn_item_emb is not None
+        if model == "ials":
+            return self.S_ials is not None or self.ials_U is not None
+        if model == "dare":
+            return self.S_dare is not None or self.ease_B is not None
         return False
 
-    # ── scoring helpers ─────────────────────────────────────────────
-
-    def _score_ease(self, user_id: int, train_vec: Optional[np.ndarray] = None) -> np.ndarray:
-        """
-        TemporalEASE inference at request time.
-        Without the stored X (training matrix) we cannot do a full X@B pass,
-        so we accept an optional sparse row vector. If not provided, returns
-        zero scores (graceful degradation).
-        """
-        if train_vec is not None:
-            return (train_vec.astype(np.float32) @ self.ease_B)  # (n_items,)
-        # Fallback: zero vector (items will be ranked by LightGCN/iALS in ensemble)
-        return np.zeros(N_ITEMS, dtype=np.float32)
-
-    def _score_lgcn(self, user_id: int) -> np.ndarray:
-        u = self.lgcn_user_emb[user_id]        # (D,)
-        return (self.lgcn_item_emb @ u).numpy() # (n_items,)
-
-    def _score_ials(self, user_id: int) -> np.ndarray:
-        return self.ials_U[user_id] @ self.ials_V.T  # (n_items,)
+    # ── scoring helpers ────────────────────────────────────────────
 
     def _normalize(self, s: np.ndarray) -> np.ndarray:
-        """Min-max normalize to [0, 1] for safe ensemble blending."""
         lo, hi = s.min(), s.max()
         if hi > lo:
             return (s - lo) / (hi - lo)
         return np.zeros_like(s)
 
+    def _get_scores(self, user_id: int, model: str) -> np.ndarray:
+        """Return (n_items,) score vector for user_id under model."""
+        # 1. Precomputed matrix (exact, fastest)
+        mat = {"ease": self.S_ease, "ials": self.S_ials,
+               "lgcn": self.S_lgcn, "dare": self.S_dare}.get(model)
+        if mat is not None:
+            return mat[user_id]
+
+        # 2. Live recompute fallback
+        if model == "ease":
+            if self.ease_B is not None:
+                # No stored training row — return B diagonal (item popularity proxy)
+                return self.ease_B.diagonal()
+            return np.zeros(N_ITEMS, dtype=np.float32)
+
+        if model == "ials":
+            if self.ials_U is not None:
+                return self.ials_U[user_id] @ self.ials_V.T
+            return np.zeros(N_ITEMS, dtype=np.float32)
+
+        if model == "lgcn":
+            if self.lgcn_user_emb is not None:
+                u = self.lgcn_user_emb[user_id]
+                return (self.lgcn_item_emb @ u).numpy()
+            return np.zeros(N_ITEMS, dtype=np.float32)
+
+        if model == "dare":
+            s = np.zeros(N_ITEMS, dtype=np.float32)
+            if self.ease_B is not None:
+                s += self.alpha * self._normalize(self.ease_B.diagonal())
+            if self.ials_U is not None:
+                s += self.gamma * self._normalize(self.ials_U[user_id] @ self.ials_V.T)
+            if self.lgcn_user_emb is not None:
+                u = self.lgcn_user_emb[user_id]
+                s += self.beta * self._normalize((self.lgcn_item_emb @ u).numpy())
+            return s
+
+        return np.zeros(N_ITEMS, dtype=np.float32)
+
     def _top_k(self, scores: np.ndarray, k: int) -> List[dict]:
         top = np.argsort(scores)[::-1][:k]
         return [
-            {"item_id": int(i), "score": round(float(scores[i]), 4),
-             "title": self.item_metadata.get(i, f"Movie {i}")}
+            {
+                "item_id": int(i),
+                "score":   round(float(scores[i]), 4),
+                "title":   self.item_metadata.get(int(i), f"Movie {i}"),
+            }
             for i in top
         ]
 
     # ── public recommend ──────────────────────────────────────────
 
     def recommend(self, user_id: int, k: int, model: str) -> List[dict]:
-        if model == "ease":
-            return self._top_k(self._score_ease(user_id), k)
-        if model == "lgcn":
-            return self._top_k(self._score_lgcn(user_id), k)
-        if model == "ials":
-            return self._top_k(self._score_ials(user_id), k)
-        if model == "dare":
-            # Blend normalized scores with learned ensemble weights
-            s = np.zeros(N_ITEMS, dtype=np.float32)
-            if self.ease_B is not None:
-                s += self.alpha * self._normalize(self._score_ease(user_id))
-            if self.lgcn_item_emb is not None:
-                s += self.beta  * self._normalize(self._score_lgcn(user_id))
-            if self.ials_U is not None:
-                s += self.gamma * self._normalize(self._score_ials(user_id))
-            return self._top_k(s, k)
-        raise HTTPException(status_code=400, detail=f"Unknown model: '{model}'. Use dare/ease/lgcn/ials.")
+        if model not in ("ease", "lgcn", "ials", "dare"):
+            raise HTTPException(status_code=400,
+                detail=f"Unknown model '{model}'. Use: dare | ease | lgcn | ials")
+        scores = self._get_scores(user_id, model)
+        return self._top_k(scores, k)
 
     # ── similar items ──────────────────────────────────────────────
 
     def similar_items(self, item_id: int, k: int) -> tuple:
-        """Returns (items_list, method_str)."""
-        # Prefer LightGCN item embeddings
         if self.lgcn_item_emb is not None:
-            query = self.lgcn_item_emb[item_id]  # (D,)
-            sims  = (self.lgcn_item_emb @ query).numpy()  # (n_items,)
+            query = self.lgcn_item_emb[item_id]
+            sims  = (self.lgcn_item_emb @ query).numpy()
             sims[item_id] = -np.inf
             top_k = np.argsort(sims)[::-1][:k]
             items = [{"item_id": int(i), "similarity": round(float(sims[i]), 4),
-                      "title": self.item_metadata.get(i, f"Movie {i}")} for i in top_k]
+                      "title": self.item_metadata.get(int(i), f"Movie {i}")} for i in top_k]
             return items, "cosine_lightgcn"
 
-        # Fall back to iALS cosine
         if self.ials_U is not None:
             q    = self.ials_V[item_id]
             norm = np.linalg.norm(self.ials_V, axis=1) + 1e-8
@@ -304,16 +318,15 @@ class ModelStore:
             sims[item_id] = -np.inf
             top_k = np.argsort(sims)[::-1][:k]
             items = [{"item_id": int(i), "similarity": round(float(sims[i]), 4),
-                      "title": self.item_metadata.get(i, f"Movie {i}")} for i in top_k]
+                      "title": self.item_metadata.get(int(i), f"Movie {i}")} for i in top_k]
             return items, "cosine_ials"
 
-        # Fall back to EASE B column similarity
         if self.ease_B is not None:
-            sims = self.ease_B[:, item_id].copy()  # (n_items,)
+            sims = self.ease_B[:, item_id].copy()
             sims[item_id] = -np.inf
             top_k = np.argsort(sims)[::-1][:k]
             items = [{"item_id": int(i), "similarity": round(float(sims[i]), 4),
-                      "title": self.item_metadata.get(i, f"Movie {i}")} for i in top_k]
+                      "title": self.item_metadata.get(int(i), f"Movie {i}")} for i in top_k]
             return items, "ease_column"
 
         raise HTTPException(status_code=503, detail="No model checkpoints loaded.")
@@ -330,32 +343,35 @@ def health():
         "status": "ok",
         "timestamp": time.time(),
         "models": {
-            "ease":  store.is_ready("ease"),
-            "lgcn":  store.is_ready("lgcn"),
-            "ials":  store.is_ready("ials"),
-            "dare":  store.is_ready("dare"),
+            "ease": store.is_ready("ease"),
+            "lgcn": store.is_ready("lgcn"),
+            "ials": store.is_ready("ials"),
+            "dare": store.is_ready("dare"),
         },
         "ensemble_weights": {
             "alpha_ease": store.alpha,
             "beta_lgcn":  store.beta,
             "gamma_ials": store.gamma,
         },
+        "titles_loaded": len(store.item_metadata) > 0 and
+                         store.item_metadata.get(0, "Movie 0") != "Movie 0",
+        "score_matrices": {
+            "ease": store.S_ease is not None,
+            "ials": store.S_ials is not None,
+            "lgcn": store.S_lgcn is not None,
+            "dare": store.S_dare is not None,
+        },
     }
 
 
 @app.get("/recommend/{user_id}", response_model=RecommendationResponse)
-def recommend(
-    user_id: int,
-    k: int = 10,
-    model: str = "dare",
-):
+def recommend(user_id: int, k: int = 10, model: str = "dare"):
     if user_id < 0 or user_id >= N_USERS:
-        raise HTTPException(status_code=404, detail=f"User {user_id} not found (valid: 0–{N_USERS-1})")
+        raise HTTPException(status_code=404,
+            detail=f"User {user_id} not found (valid: 0–{N_USERS-1})")
     if not store.is_ready(model):
-        raise HTTPException(
-            status_code=503,
-            detail=f"Model '{model}' not loaded. Run: python src/run_experiment.py --data_dir ml-1m/"
-        )
+        raise HTTPException(status_code=503,
+            detail=f"Model '{model}' not loaded. Run: python src/run_experiment.py --data_dir ml-1m/")
 
     t0   = time.perf_counter()
     recs = store.recommend(user_id, k, model)
@@ -373,7 +389,8 @@ def recommend(
 @app.get("/similar/{item_id}", response_model=SimilarItemsResponse)
 def similar_items(item_id: int, k: int = 10):
     if item_id < 0 or item_id >= N_ITEMS:
-        raise HTTPException(status_code=404, detail=f"Item {item_id} not found (valid: 0–{N_ITEMS-1})")
+        raise HTTPException(status_code=404,
+            detail=f"Item {item_id} not found (valid: 0–{N_ITEMS-1})")
     items, method = store.similar_items(item_id, k)
     return SimilarItemsResponse(item_id=item_id, similar_items=items, method=method)
 
@@ -387,7 +404,7 @@ def record_feedback(event: FeedbackEvent, background: BackgroundTasks):
 def _process_feedback(event: dict):
     feedback_buffer.append(event)
     if len(feedback_buffer) % 100 == 0:
-        logger.info(f"Feedback buffer size: {len(feedback_buffer)}")
+        logger.info(f"Feedback buffer: {len(feedback_buffer)} events")
 
 
 @app.get("/metrics")
