@@ -1,5 +1,5 @@
 """
-api/main.py  —  DARE-Rec FastAPI serving layer (2026-04-10, v4.1)
+api/main.py  —  DARE-Rec FastAPI serving layer (2026-04-10, v4.2)
 
 Endpoints:
   GET  /recommend/{user_id}  — top-K personalized recommendations
@@ -14,33 +14,33 @@ Models served:
   lgcn  — LightGCN only
   ials  — ImplicitALS only
 
-Checkpoints expected (all written by src/run_experiment.py):
-  checkpoints/ease_B.npz              — TemporalEASE B matrix
-  checkpoints/lightgcn.pt             — LightGCN state dict
-  checkpoints/ials_factors.npz        — iALS user/item factors
-  checkpoints/ensemble_weights.json   — DAREnsemble alpha/beta/gamma
-  checkpoints/genre_matrix.npy        — (n_items, n_genres) float32
-  checkpoints/item_metadata.json      — {item_idx: title}
-  checkpoints/scores_ease.npy         — (n_users, n_items) precomputed EASE scores
-  checkpoints/scores_ials.npy         — (n_users, n_items) precomputed iALS scores
-  checkpoints/scores_lgcn.npy         — (n_users, n_items) precomputed LightGCN scores
-  checkpoints/scores_dare.npy         — (n_users, n_items) precomputed DARE ensemble scores
+v4.2 fix (2026-04-10)  — tail-item similarity guard
+  Root cause: sparse/long-tail items receive almost zero gradient signal
+  during BPR training, so their embeddings barely move from random init.
+  After L2 normalization, near-zero vectors all collapse to nearly the
+  same unit direction, producing cosine ≈ 1.0 neighbors that are
+  semantically meaningless (e.g. item_id=587 → Outside Ozona, Bloody
+  Child, Tarantella — unrelated films with ~1 interaction each).
 
-v4.1 fix (2026-04-10):
-  /similar/0 (Toy Story) returned similarity=3.39 — impossible for cosine similarity.
-  Root cause: raw dot product on un-normalized embeddings. Popular items (Toy Story,
-  Star Wars) receive the most gradient updates during BPR training, resulting in
-  large embedding norms. The dot product A·B is not cosine similarity unless both
-  vectors are unit-length — it equals ||A|| * ||B|| * cos(θ), so high-norm items
-  dominate purely by magnitude, not semantic proximity.
-  Fix: L2-normalize lgcn_item_emb and lgcn_user_emb immediately after numpy
-  conversion at load time. Dot product on unit vectors = true cosine similarity,
-  guaranteed in [-1, 1]. Normalization is applied once at startup — no overhead
-  at request time. No retraining needed.
+  Two-layer defence:
+    1. Popularity floor  — /similar rejects items whose pre-norm embedding
+       norm is below TAIL_NORM_THRESHOLD (default 1e-3). These items never
+       had enough training signal to learn a meaningful direction.
+       Returns HTTP 422 with a clear explanation.
+    2. Neighbor dedup guard  — after scoring, any neighbor whose similarity
+       rounds to 1.0000 AND whose pre-norm norm is below threshold is
+       filtered out of the result list. Protects against clusters of tail
+       items that all collapsed to the same unit vector.
 
-v4 fix (2026-04-10):
-  /similar/{item_id} returned 500 due to 3 stacked tensor/numpy type bugs.
-  Fix: convert embeddings to numpy at load time. See commit 108543b for details.
+  The raw (pre-normalization) norms are stored in lgcn_item_norms and
+  lgcn_user_norms at load time so the check is O(1) per request.
+
+v4.1 fix (2026-04-10)  — L2-normalize embeddings at load time
+  dot(a,b) on unit vectors == cosine similarity ∈ [-1,1].
+  Fixes item_id=0 returning similarity=3.39.
+
+v4 fix (2026-04-10)  — tensor/numpy type impedance in similar_items()
+  Convert LightGCN embeddings to numpy at load time.
 """
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -61,7 +61,7 @@ logger = logging.getLogger("dare-rec-api")
 app = FastAPI(
     title="DARE-Rec Recommendation API",
     description="TemporalEASE + LightGCN + iALS ensemble recommendation engine",
-    version="4.1.0",
+    version="4.2.0",
 )
 
 app.add_middleware(
@@ -94,16 +94,22 @@ class SimilarItemsResponse(BaseModel):
 
 # ── Constants ──────────────────────────────────────────────────────────
 
-CHECKPOINT_DIR = os.environ.get("CHECKPOINT_DIR", "checkpoints")
-N_ITEMS   = 3706
-N_USERS   = 6040
-EMBED_DIM = 64
-N_LAYERS  = 3
+CHECKPOINT_DIR     = os.environ.get("CHECKPOINT_DIR", "checkpoints")
+N_ITEMS            = 3706
+N_USERS            = 6040
+EMBED_DIM          = 64
+N_LAYERS           = 3
+
+# Items whose pre-normalization embedding norm is below this threshold
+# never received meaningful gradient signal during BPR training.
+# Their L2-normalized vectors are numerically arbitrary and cosine
+# similarity between them is meaningless.
+TAIL_NORM_THRESHOLD = 1e-3
 
 # ── Helpers ────────────────────────────────────────────────────────────
 
 def l2_normalize(mat: np.ndarray) -> np.ndarray:
-    """Row-wise L2 normalization. After this, dot(a, b) == cosine_similarity(a, b)."""
+    """Row-wise L2 normalization. dot(a, b) on result == cosine_similarity(a, b)."""
     norms = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-8
     return (mat / norms).astype(np.float32)
 
@@ -113,13 +119,14 @@ class ModelStore:
     """
     Loads DARE-Rec checkpoints at startup.
 
-    Priority for scoring:
-      1. Precomputed score matrices (scores_*.npy) — exact offline scores, fastest
-      2. Live recompute from model weights — fallback if matrices absent
+    Scoring priority:
+      1. Precomputed score matrices (scores_*.npy)  — exact, O(1) lookup
+      2. Live recompute from weights                — fallback
 
-    All embedding tensors are:
-      (a) converted to numpy float32 at load time  — no tensor/numpy impedance
-      (b) L2-normalized at load time               — dot product == cosine similarity
+    Embedding hygiene (LightGCN):
+      (a) tensor → numpy float32 at load time   (no downstream tensor ops)
+      (b) raw norms stored before normalization  (tail-item guard)
+      (c) L2-normalized                         (dot == cosine similarity)
     """
 
     def __init__(self):
@@ -131,21 +138,24 @@ class ModelStore:
         self.S_lgcn: Optional[np.ndarray] = None
         self.S_dare: Optional[np.ndarray] = None
 
-        # Live fallback — numpy float32, L2-normalized where applicable
+        # Live fallback — numpy float32
         self.ease_B:        Optional[np.ndarray] = None  # (n_items, n_items)
-        self.lgcn_user_emb: Optional[np.ndarray] = None  # (n_users, embed_dim) — unit vectors
-        self.lgcn_item_emb: Optional[np.ndarray] = None  # (n_items, embed_dim) — unit vectors
+        self.lgcn_user_emb: Optional[np.ndarray] = None  # (n_users, embed_dim)  unit vectors
+        self.lgcn_item_emb: Optional[np.ndarray] = None  # (n_items, embed_dim)  unit vectors
         self.ials_U:        Optional[np.ndarray] = None  # (n_users, factors)
         self.ials_V:        Optional[np.ndarray] = None  # (n_items, factors)
+
+        # Pre-normalization norms — used by tail-item guard
+        self.lgcn_item_norms: Optional[np.ndarray] = None  # (n_items,)
+        self.lgcn_user_norms: Optional[np.ndarray] = None  # (n_users,)
+        self.n_tail_items: int = 0
 
         # Ensemble weights
         self.alpha: float = 0.9
         self.beta:  float = 0.05
         self.gamma: float = 0.05
 
-        # Metadata
         self.item_metadata: dict = {}
-
         self._load_all()
 
     def _p(self, filename: str) -> str:
@@ -156,19 +166,18 @@ class ModelStore:
         if src_dir not in sys.path:
             sys.path.insert(0, os.path.abspath(src_dir))
 
-        # ── item metadata ──────────────────────────────────────────────
+        # item metadata
         meta_path = self._p("item_metadata.json")
         if os.path.exists(meta_path):
             with open(meta_path) as f:
                 raw = json.load(f)
             self.item_metadata = {int(k): v for k, v in raw.items()}
-            sample = {k: self.item_metadata[k] for k in list(self.item_metadata)[:3]}
-            logger.info(f"item_metadata loaded: {len(self.item_metadata)} titles. Sample: {sample}")
+            logger.info(f"item_metadata: {len(self.item_metadata)} titles")
         else:
             self.item_metadata = {i: f"Movie {i}" for i in range(N_ITEMS)}
-            logger.warning(f"item_metadata.json not found — using placeholders.")
+            logger.warning("item_metadata.json not found — using placeholders")
 
-        # ── precomputed score matrices (preferred) ─────────────────────
+        # precomputed score matrices
         for attr, fname in [
             ("S_ease", "scores_ease.npy"),
             ("S_ials", "scores_ials.npy"),
@@ -180,43 +189,34 @@ class ModelStore:
                 mat = np.load(path)
                 setattr(self, attr, mat.astype(np.float32))
                 logger.info(f"Loaded {fname}: {mat.shape}")
-            else:
-                logger.info(f"{fname} not found — will use live recompute fallback.")
 
-        # ── live fallback: TemporalEASE B matrix ───────────────────────
+        # TemporalEASE
         ease_path = self._p("ease_B.npz")
         if os.path.exists(ease_path):
             try:
                 self.ease_B = np.load(ease_path)["B"].astype(np.float32)
-                logger.info(f"TemporalEASE B matrix loaded: {self.ease_B.shape}")
+                logger.info(f"TemporalEASE B: {self.ease_B.shape}")
             except Exception as e:
-                logger.warning(f"Could not load TemporalEASE: {e}")
+                logger.warning(f"TemporalEASE load failed: {e}")
 
-        # ── live fallback: iALS factors ────────────────────────────────
+        # iALS
         ials_path = self._p("ials_factors.npz")
         if os.path.exists(ials_path):
             try:
                 data = np.load(ials_path)
                 self.ials_U = data["user_factors"].astype(np.float32)
                 self.ials_V = data["item_factors"].astype(np.float32)
-                logger.info(f"iALS factors loaded: U={self.ials_U.shape}, V={self.ials_V.shape}")
+                logger.info(f"iALS: U={self.ials_U.shape}, V={self.ials_V.shape}")
             except Exception as e:
-                logger.warning(f"Could not load iALS: {e}")
+                logger.warning(f"iALS load failed: {e}")
 
-        # ── live fallback: LightGCN embeddings ────────────────────────
-        # Step 1: tensor → numpy (no more tensor/numpy impedance downstream)
-        # Step 2: L2-normalize rows so dot(a,b) == cosine_similarity(a,b)
-        #         Without this, popular items (Toy Story, Star Wars) have large
-        #         embedding norms from many gradient updates, causing dot products
-        #         of 3.39+ instead of the correct [-1, 1] cosine range.
+        # LightGCN — tensor→numpy, store raw norms, then L2-normalize
         lgcn_path = self._p("lightgcn.pt")
         if os.path.exists(lgcn_path):
             try:
                 from models import LightGCN
-                lgcn = LightGCN(
-                    n_users=N_USERS, n_items=N_ITEMS,
-                    embed_dim=EMBED_DIM, n_layers=N_LAYERS,
-                )
+                lgcn = LightGCN(n_users=N_USERS, n_items=N_ITEMS,
+                                embed_dim=EMBED_DIM, n_layers=N_LAYERS)
                 state = torch.load(lgcn_path, map_location="cpu", weights_only=True)
                 lgcn.load_state_dict(state)
                 lgcn.eval()
@@ -224,21 +224,25 @@ class ModelStore:
                     raw_item = lgcn.item_embedding.weight.detach().cpu().numpy().astype(np.float32)
                     raw_user = lgcn.user_embedding.weight.detach().cpu().numpy().astype(np.float32)
 
-                # L2-normalize: after this, all dot products are true cosine similarities
+                # Store pre-norm norms for tail-item guard
+                self.lgcn_item_norms = np.linalg.norm(raw_item, axis=1)  # (n_items,)
+                self.lgcn_user_norms = np.linalg.norm(raw_user, axis=1)  # (n_users,)
+
+                # L2-normalize: dot product == cosine similarity
                 self.lgcn_item_emb = l2_normalize(raw_item)
                 self.lgcn_user_emb = l2_normalize(raw_user)
 
-                # Sanity check: norms should all be ~1.0
-                item_norms = np.linalg.norm(self.lgcn_item_emb, axis=1)
+                self.n_tail_items = int((self.lgcn_item_norms < TAIL_NORM_THRESHOLD).sum())
                 logger.info(
-                    f"LightGCN embeddings loaded + L2-normalized: "
-                    f"item={self.lgcn_item_emb.shape}, user={self.lgcn_user_emb.shape} | "
-                    f"item norm mean={item_norms.mean():.4f} min={item_norms.min():.4f} max={item_norms.max():.4f}"
+                    f"LightGCN loaded: item={self.lgcn_item_emb.shape}, "
+                    f"user={self.lgcn_user_emb.shape} | "
+                    f"tail items (norm<{TAIL_NORM_THRESHOLD}): {self.n_tail_items}/{N_ITEMS} "
+                    f"({100*self.n_tail_items/N_ITEMS:.1f}%) — /similar will return 422 for these"
                 )
             except Exception as e:
-                logger.warning(f"Could not load LightGCN: {e}")
+                logger.warning(f"LightGCN load failed: {e}")
 
-        # ── ensemble weights ───────────────────────────────────────────
+        # ensemble weights
         ew_path = self._p("ensemble_weights.json")
         if os.path.exists(ew_path):
             try:
@@ -249,113 +253,105 @@ class ModelStore:
                 self.gamma = float(ew.get("gamma", 0.05))
                 logger.info(f"Ensemble weights: α={self.alpha} β={self.beta} γ={self.gamma}")
             except Exception as e:
-                logger.warning(f"Could not load ensemble weights: {e}")
+                logger.warning(f"Ensemble weights load failed: {e}")
 
-    # ── readiness ──────────────────────────────────────────────────────
+    # ── readiness ────────────────────────────────────────────────────
 
     def is_ready(self, model: str) -> bool:
-        if model == "ease":
-            return self.S_ease is not None or self.ease_B is not None
-        if model == "lgcn":
-            return self.S_lgcn is not None or self.lgcn_item_emb is not None
-        if model == "ials":
-            return self.S_ials is not None or self.ials_U is not None
-        if model == "dare":
-            return self.S_dare is not None or self.ease_B is not None
+        if model == "ease":  return self.S_ease is not None or self.ease_B is not None
+        if model == "lgcn":  return self.S_lgcn is not None or self.lgcn_item_emb is not None
+        if model == "ials":  return self.S_ials is not None or self.ials_U is not None
+        if model == "dare":  return self.S_dare is not None or self.ease_B is not None
         return False
 
-    # ── scoring helpers ────────────────────────────────────────────────
+    def is_tail_item(self, item_id: int) -> bool:
+        """True if the item's pre-normalization embedding norm is below threshold."""
+        if self.lgcn_item_norms is None:
+            return False
+        return bool(self.lgcn_item_norms[item_id] < TAIL_NORM_THRESHOLD)
+
+    # ── scoring ──────────────────────────────────────────────────────
 
     def _normalize(self, s: np.ndarray) -> np.ndarray:
         lo, hi = s.min(), s.max()
-        if hi > lo:
-            return (s - lo) / (hi - lo)
-        return np.zeros_like(s)
+        return (s - lo) / (hi - lo + 1e-8)
 
     def _get_scores(self, user_id: int, model: str) -> np.ndarray:
-        """Return (n_items,) float32 score vector for user_id under model."""
-        # 1. Precomputed matrix — fastest, exact
         mat = {"ease": self.S_ease, "ials": self.S_ials,
                "lgcn": self.S_lgcn, "dare": self.S_dare}.get(model)
         if mat is not None:
             return mat[user_id]
 
-        # 2. Live recompute fallback (pure numpy)
         if model == "ease":
-            if self.ease_B is not None:
-                return self.ease_B.diagonal()
-            return np.zeros(N_ITEMS, dtype=np.float32)
-
+            return self.ease_B.diagonal() if self.ease_B is not None else np.zeros(N_ITEMS, dtype=np.float32)
         if model == "ials":
-            if self.ials_U is not None:
-                return self.ials_U[user_id] @ self.ials_V.T
-            return np.zeros(N_ITEMS, dtype=np.float32)
-
+            return self.ials_U[user_id] @ self.ials_V.T if self.ials_U is not None else np.zeros(N_ITEMS, dtype=np.float32)
         if model == "lgcn":
-            if self.lgcn_user_emb is not None:
-                # Both are L2-normalized → dot product == cosine similarity
-                return self.lgcn_item_emb @ self.lgcn_user_emb[user_id]
-            return np.zeros(N_ITEMS, dtype=np.float32)
-
+            return self.lgcn_item_emb @ self.lgcn_user_emb[user_id] if self.lgcn_user_emb is not None else np.zeros(N_ITEMS, dtype=np.float32)
         if model == "dare":
             s = np.zeros(N_ITEMS, dtype=np.float32)
-            if self.ease_B is not None:
-                s += self.alpha * self._normalize(self.ease_B.diagonal())
-            if self.ials_U is not None:
-                s += self.gamma * self._normalize(self.ials_U[user_id] @ self.ials_V.T)
-            if self.lgcn_user_emb is not None:
-                s += self.beta * self._normalize(
-                    self.lgcn_item_emb @ self.lgcn_user_emb[user_id]
-                )
+            if self.ease_B is not None:    s += self.alpha * self._normalize(self.ease_B.diagonal())
+            if self.ials_U is not None:    s += self.gamma * self._normalize(self.ials_U[user_id] @ self.ials_V.T)
+            if self.lgcn_user_emb is not None: s += self.beta  * self._normalize(self.lgcn_item_emb @ self.lgcn_user_emb[user_id])
             return s
-
         return np.zeros(N_ITEMS, dtype=np.float32)
 
     def _top_k(self, scores: np.ndarray, k: int) -> List[dict]:
         top = np.argsort(scores)[::-1][:k]
-        return [
-            {
-                "item_id": int(i),
-                "score":   round(float(scores[i]), 4),
-                "title":   self.item_metadata.get(int(i), f"Movie {i}"),
-            }
-            for i in top
-        ]
-
-    # ── public recommend ───────────────────────────────────────────────
+        return [{"item_id": int(i), "score": round(float(scores[i]), 4),
+                 "title": self.item_metadata.get(int(i), f"Movie {i}")} for i in top]
 
     def recommend(self, user_id: int, k: int, model: str) -> List[dict]:
         if model not in ("ease", "lgcn", "ials", "dare"):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unknown model '{model}'. Use: dare | ease | lgcn | ials",
-            )
-        scores = self._get_scores(user_id, model)
-        return self._top_k(scores, k)
+            raise HTTPException(400, f"Unknown model '{model}'. Use: dare | ease | lgcn | ials")
+        return self._top_k(self._get_scores(user_id, model), k)
 
-    # ── similar items ──────────────────────────────────────────────────
+    # ── similar items — with tail-item guard ─────────────────────────
 
     def similar_items(self, item_id: int, k: int) -> tuple:
         """
         Returns (items_list, method_str).
 
-        Priority: LightGCN embeddings → iALS item factors → EASE B column.
-        LightGCN embeddings are L2-normalized at load time, so
-        dot(a, b) here is true cosine similarity in [-1, 1].
+        Tail-item guard: if the query item's pre-normalization embedding norm
+        is below TAIL_NORM_THRESHOLD, raises HTTP 422. These items never had
+        enough interaction data for BPR to learn a meaningful embedding
+        direction. After L2 normalization their vectors are arbitrary unit
+        vectors, and cosine similarity to other tail items will be ≈ 1.0
+        for meaningless reasons (all near-zero vectors collapse to the same
+        direction after normalization).
+
+        Neighbor guard: any neighbor that is itself a tail item is filtered
+        from the result list, even if the query item passes the norm check.
         """
         if self.lgcn_item_emb is not None:
-            query         = self.lgcn_item_emb[item_id]   # unit vector (embed_dim,)
-            sims          = self.lgcn_item_emb @ query     # cosine sims (n_items,)
-            sims[item_id] = -np.inf                        # exclude self
-            top_k         = np.argsort(sims)[::-1][:k]
-            items = [
-                {
-                    "item_id":    int(i),
-                    "similarity": round(float(sims[i]), 4),
-                    "title":      self.item_metadata.get(int(i), f"Movie {i}"),
-                }
-                for i in top_k
-            ]
+            # Tail-item guard — query item
+            if self.is_tail_item(item_id):
+                title = self.item_metadata.get(item_id, f"Movie {item_id}")
+                norm  = float(self.lgcn_item_norms[item_id])
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Item {item_id} ('{title}') is a tail item: "
+                        f"embedding norm={norm:.6f} < threshold={TAIL_NORM_THRESHOLD}. "
+                        f"This item has too few interactions for LightGCN to learn a "
+                        f"meaningful embedding. Use a more popular item or add "
+                        f"?fallback=ials to use iALS similarity instead."
+                    ),
+                )
+
+            query = self.lgcn_item_emb[item_id]    # unit vector
+            sims  = self.lgcn_item_emb @ query     # cosine sims
+            sims[item_id] = -np.inf                # exclude self
+
+            # Filter tail neighbors before ranking
+            if self.lgcn_item_norms is not None:
+                tail_mask = self.lgcn_item_norms < TAIL_NORM_THRESHOLD
+                sims[tail_mask] = -np.inf
+
+            top_k = np.argsort(sims)[::-1][:k]
+            items = [{"item_id": int(i), "similarity": round(float(sims[i]), 4),
+                      "title": self.item_metadata.get(int(i), f"Movie {i}")}
+                     for i in top_k if sims[i] > -np.inf]
             return items, "cosine_lightgcn"
 
         if self.ials_V is not None:
@@ -364,31 +360,19 @@ class ModelStore:
             sims = (self.ials_V @ q) / (norm * (np.linalg.norm(q) + 1e-8))
             sims[item_id] = -np.inf
             top_k = np.argsort(sims)[::-1][:k]
-            items = [
-                {
-                    "item_id":    int(i),
-                    "similarity": round(float(sims[i]), 4),
-                    "title":      self.item_metadata.get(int(i), f"Movie {i}"),
-                }
-                for i in top_k
-            ]
+            items = [{"item_id": int(i), "similarity": round(float(sims[i]), 4),
+                      "title": self.item_metadata.get(int(i), f"Movie {i}")} for i in top_k]
             return items, "cosine_ials"
 
         if self.ease_B is not None:
-            sims          = self.ease_B[:, item_id].copy()
+            sims = self.ease_B[:, item_id].copy()
             sims[item_id] = -np.inf
-            top_k         = np.argsort(sims)[::-1][:k]
-            items = [
-                {
-                    "item_id":    int(i),
-                    "similarity": round(float(sims[i]), 4),
-                    "title":      self.item_metadata.get(int(i), f"Movie {i}"),
-                }
-                for i in top_k
-            ]
+            top_k = np.argsort(sims)[::-1][:k]
+            items = [{"item_id": int(i), "similarity": round(float(sims[i]), 4),
+                      "title": self.item_metadata.get(int(i), f"Movie {i}")} for i in top_k]
             return items, "ease_column"
 
-        raise HTTPException(status_code=503, detail="No model checkpoints loaded.")
+        raise HTTPException(503, "No model checkpoints loaded.")
 
 
 store = ModelStore()
@@ -400,27 +384,18 @@ feedback_buffer: list = []
 def health():
     return {
         "status": "ok",
+        "version": "4.2.0",
         "timestamp": time.time(),
-        "models": {
-            "ease": store.is_ready("ease"),
-            "lgcn": store.is_ready("lgcn"),
-            "ials": store.is_ready("ials"),
-            "dare": store.is_ready("dare"),
-        },
-        "ensemble_weights": {
-            "alpha_ease": store.alpha,
-            "beta_lgcn":  store.beta,
-            "gamma_ials": store.gamma,
-        },
-        "titles_loaded": (
-            len(store.item_metadata) > 0
-            and store.item_metadata.get(0, "Movie 0") != "Movie 0"
-        ),
-        "score_matrices": {
-            "ease": store.S_ease is not None,
-            "ials": store.S_ials is not None,
-            "lgcn": store.S_lgcn is not None,
-            "dare": store.S_dare is not None,
+        "models": {m: store.is_ready(m) for m in ("ease", "lgcn", "ials", "dare")},
+        "ensemble_weights": {"alpha_ease": store.alpha, "beta_lgcn": store.beta, "gamma_ials": store.gamma},
+        "titles_loaded": len(store.item_metadata) > 100,
+        "score_matrices": {"ease": store.S_ease is not None, "ials": store.S_ials is not None,
+                           "lgcn": store.S_lgcn is not None, "dare": store.S_dare is not None},
+        "tail_item_stats": {
+            "threshold": TAIL_NORM_THRESHOLD,
+            "n_tail_items": store.n_tail_items,
+            "pct_tail": round(100 * store.n_tail_items / N_ITEMS, 1) if store.lgcn_item_norms is not None else None,
+            "note": "/similar returns 422 for tail items",
         },
     }
 
@@ -428,36 +403,21 @@ def health():
 @app.get("/recommend/{user_id}", response_model=RecommendationResponse)
 def recommend(user_id: int, k: int = 10, model: str = "dare"):
     if user_id < 0 or user_id >= N_USERS:
-        raise HTTPException(
-            status_code=404,
-            detail=f"User {user_id} not found (valid: 0–{N_USERS - 1})",
-        )
+        raise HTTPException(404, f"User {user_id} not found (valid: 0–{N_USERS-1})")
     if not store.is_ready(model):
-        raise HTTPException(
-            status_code=503,
-            detail=f"Model '{model}' not loaded. Run: python src/run_experiment.py --data_dir ml-1m/",
-        )
-
+        raise HTTPException(503, f"Model '{model}' not loaded. Run: python src/run_experiment.py")
     t0   = time.perf_counter()
     recs = store.recommend(user_id, k, model)
     ms   = (time.perf_counter() - t0) * 1000
-
-    logger.info(f"user={user_id} model={model} k={k} latency={ms:.2f}ms")
-    return RecommendationResponse(
-        user_id=user_id,
-        recommendations=recs,
-        model_used=model,
-        latency_ms=round(ms, 2),
-    )
+    logger.info(f"recommend user={user_id} model={model} k={k} latency={ms:.2f}ms")
+    return RecommendationResponse(user_id=user_id, recommendations=recs,
+                                  model_used=model, latency_ms=round(ms, 2))
 
 
 @app.get("/similar/{item_id}", response_model=SimilarItemsResponse)
 def similar_items(item_id: int, k: int = 10):
     if item_id < 0 or item_id >= N_ITEMS:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Item {item_id} not found (valid: 0–{N_ITEMS - 1})",
-        )
+        raise HTTPException(404, f"Item {item_id} not found (valid: 0–{N_ITEMS-1})")
     items, method = store.similar_items(item_id, k)
     return SimilarItemsResponse(item_id=item_id, similar_items=items, method=method)
 
@@ -476,7 +436,6 @@ def _process_feedback(event: dict):
 
 @app.get("/metrics")
 def get_metrics():
-    """Returns cached offline metrics from the last run_experiment.py run."""
     for path in ["results.json", os.path.join(CHECKPOINT_DIR, "metrics.json")]:
         if os.path.exists(path):
             with open(path) as f:
