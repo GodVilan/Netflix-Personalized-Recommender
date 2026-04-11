@@ -1,5 +1,5 @@
 """
-models.py  —  DARE-Rec rewrite (2026-04-10, audit-fixed 2026-04-10, ials-fix 2026-04-10)
+models.py  —  DARE-Rec (2026-04-10, audit-fixed, ials-fix, emb-fix)
 
 Models implemented:
   1. TemporalEASE       — time-decayed EASE^R (unpublished variant)
@@ -10,13 +10,17 @@ Models implemented:
 
 Architecture: DARE-Rec (Diversity-Aware Re-ranking Ensemble Recommender)
 
+LightGCN forward() update (2026-04-10):
+  forward() now accepts neg_items of shape (B,) or (B, n_neg).
+  When neg_items is 2-D, BPR loss is averaged over all n_neg negatives
+  per sample (vectorised via einsum — no extra forward passes).
+  This enables n_neg=8 training from trainer.py without changing the
+  model–trainer interface: trainer calls model(u, pos, negs) as before.
+
 Published baselines this targets to beat:
   EASE^R : NDCG@10 = 0.336  (Anelli et al. 2022, ML-1M 80/20)
   iALS   : NDCG@10 = 0.306  (Anelli et al. 2022)
   NeuMF  : NDCG@10 = 0.277  (Anelli et al. 2022)
-
-DAREnsemble target: NDCG@10 ~0.35-0.38
-MMRReranker unique contribution: first joint NDCG+ILD reporting on ML-1M
 """
 
 import math
@@ -30,9 +34,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────
 # 1. TemporalEASE
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────
 class TemporalEASE:
     """
     Time-decayed EASE^R (Steck 2019 + temporal weighting, unpublished variant).
@@ -45,113 +49,59 @@ class TemporalEASE:
       Replace binary X with time-decayed weight matrix X_t where
       X_t[u,i] = exp(-decay * days_since_interaction).
       Everything else is identical — the closed-form solution still applies.
-
-    Why this works:
-      EASE^R fits an item-item similarity matrix that minimises reconstruction
-      loss on X. Using X_t instead biases the similarity matrix toward items
-      that co-occur in *recent* windows, which better captures current taste.
-
-    λ tuning (ML-1M 80/20):
-      λ=500 is the standard EASE^R optimum (Anelli 2022 reports λ=400-600).
-      With time decay, slightly lower λ=400 works better because X_t has
-      lower Frobenius norm than binary X, so less regularisation is needed.
     """
 
     def __init__(self, l2_lambda: float = 400.0):
         self.l2_lambda = l2_lambda
-        self.B: Optional[np.ndarray] = None        # item-item similarity (n_items, n_items)
-        self._X: Optional[csr_matrix] = None       # training matrix (stored for scoring)
+        self.B: Optional[np.ndarray] = None
+        self._X: Optional[csr_matrix] = None
 
     def fit(self, X: csr_matrix) -> "TemporalEASE":
-        """
-        X: (n_users, n_items) — can be binary or time-decayed float.
-        Closed-form: B = (G + λI)^{-1}, diag zeroed, each col normalised.
-        """
         print(f"  [TemporalEASE] fitting {X.shape}, λ={self.l2_lambda}")
         self._X = X.copy()
-
-        # G = X^T X  (item-item gram matrix)
         G = (X.T @ X).toarray().astype(np.float64)
         diag_idx = np.diag_indices_from(G)
         G[diag_idx] += self.l2_lambda
-
-        # Closed-form inverse
-        P = np.linalg.inv(G)          # (n_items, n_items)
-
-        # EASE formula: B_ij = -P_ij / P_ii  for i≠j,  B_ii = 0
-        B = P / (-np.diag(P))         # broadcast: each col / its diagonal element
+        P = np.linalg.inv(G)
+        B = P / (-np.diag(P))
         np.fill_diagonal(B, 0.0)
         self.B = B.astype(np.float32)
         print(f"  [TemporalEASE] B matrix: {self.B.shape}, non-zero ratio: {(self.B != 0).mean():.3f}")
         return self
 
     def predict_user(self, user_idx: int) -> np.ndarray:
-        """Returns score vector (n_items,) for a single user."""
-        x = self._X[user_idx].toarray().astype(np.float32).flatten()  # (n_items,)
+        x = self._X[user_idx].toarray().astype(np.float32).flatten()
         return x @ self.B
 
-    def recommend(
-        self,
-        user_idx: int,
-        n: int = 10,
-        exclude_seen: Optional[np.ndarray] = None,
-    ) -> np.ndarray:
+    def recommend(self, user_idx: int, n: int = 10,
+                  exclude_seen: Optional[np.ndarray] = None) -> np.ndarray:
         scores = self.predict_user(user_idx)
         if exclude_seen is not None and len(exclude_seen) > 0:
             scores[exclude_seen] = -np.inf
         return np.argsort(scores)[::-1][:n]
 
     def score_all_users(self, exclude_train: bool = True) -> np.ndarray:
-        """
-        Compute scores for ALL users at once via matrix multiply.
-        Returns (n_users, n_items) float32 score matrix.
-        Used by DAREnsemble for fast ensemble scoring.
-        """
         print("  [TemporalEASE] computing full score matrix (X @ B)...")
-        X_dense = self._X.toarray().astype(np.float32)   # (n_users, n_items)
-        S = X_dense @ self.B                              # (n_users, n_items)
+        X_dense = self._X.toarray().astype(np.float32)
+        S = X_dense @ self.B
         if exclude_train:
             rows, cols = self._X.nonzero()
             S[rows, cols] = -np.inf
         return S
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. iALS  (Implicit ALS baseline)
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────
+# 2. iALS
+# ───────────────────────────────────────────────────────────────────
 class ImplicitALS:
     """
     Weighted ALS (Hu et al. 2008) via the `implicit` library.
-
-    Hyperparameters tuned for ML-1M 80/20 holdout:
-      n_factors=256, alpha=1.0, reg=0.01, iterations=50
-
-    implicit API contract (v0.5+):
-      fit(user_items)  expects shape (n_users, n_items)  ← user_item directly
-      After fitting:
-        model.user_factors.shape == (n_users, n_factors)
-        model.item_factors.shape == (n_items, n_factors)
-      So  user_factors @ item_factors.T  →  (n_users, n_items)  ✓
-
-    Previous bug:
-      Code was calling fit(user_item.T * alpha), i.e. fit on item_user matrix
-      of shape (n_items, n_users). The library then assigns:
-        user_factors → rows of the input → n_items rows  (WRONG)
-        item_factors → cols of the input → n_users rows  (WRONG)
-      Result: U @ V.T was (n_items, n_users), score matrix was transposed,
-      and _user_item.nonzero() col indices (max=n_items-1) were applied as
-      row indices into S (size n_items), hitting out-of-bounds at index 3706.
+    Hyperparameters tuned for ML-1M 80/20 holdout.
     """
 
-    def __init__(
-        self,
-        n_factors: int = 256,
-        regularization: float = 0.01,
-        iterations: int = 50,
-        alpha: float = 1.0,
-        use_gpu: bool = False,
-        random_state: int = 42,
-    ):
+    def __init__(self, n_factors: int = 256, regularization: float = 0.01,
+                 iterations: int = 50, alpha: float = 1.0,
+                 use_gpu: bool = False, random_state: int = 42):
         self.n_factors = n_factors
         self.regularization = regularization
         self.iterations = iterations
@@ -169,120 +119,66 @@ class ImplicitALS:
         except ImportError:
             raise ImportError("pip install implicit")
 
-        # Store in correct (n_users, n_items) orientation
         self._user_item = user_item.tocsr().astype(np.float32).copy()
         self.n_users, self.n_items = self._user_item.shape
-
-        # Apply confidence scaling: c_ui = 1 + alpha * r_ui
-        # Pass the weighted user_item matrix directly — NOT transposed.
-        # implicit.als.fit() expects (n_users, n_items) user_items matrix.
         weighted = (self._user_item * self.alpha).tocsr().astype(np.float32)
 
         self.model = AlternatingLeastSquares(
-            factors=self.n_factors,
-            regularization=self.regularization,
-            iterations=self.iterations,
-            use_gpu=self.use_gpu,
-            calculate_training_loss=False,
-            random_state=self.random_state,
+            factors=self.n_factors, regularization=self.regularization,
+            iterations=self.iterations, use_gpu=self.use_gpu,
+            calculate_training_loss=False, random_state=self.random_state,
         )
-        # Correct call: user_items shape = (n_users, n_items)
         self.model.fit(weighted, show_progress=True)
 
-        # Shape guard — fail immediately if implicit swaps orientation
         uf = np.asarray(self.model.user_factors)
         vf = np.asarray(self.model.item_factors)
         if uf.shape[0] != self.n_users or vf.shape[0] != self.n_items:
             raise ValueError(
-                f"[ImplicitALS] Factor shape mismatch after fit — "
-                f"user_factors={uf.shape}, item_factors={vf.shape}, "
-                f"expected ({self.n_users}, f) and ({self.n_items}, f). "
-                f"Check implicit library version and input matrix orientation."
+                f"[ImplicitALS] Factor shape mismatch: "
+                f"user_factors={uf.shape}, item_factors={vf.shape}"
             )
         return self
 
-    def recommend(
-        self,
-        user_idx: int,
-        n: int = 10,
-        exclude_seen: Optional[np.ndarray] = None,
-    ) -> np.ndarray:
-        # implicit ≥0.6: filter_already_liked_items kwarg
-        # implicit <0.6:  filter_already_liked kwarg
-        # Try both for compatibility
+    def recommend(self, user_idx: int, n: int = 10,
+                  exclude_seen: Optional[np.ndarray] = None) -> np.ndarray:
         try:
             items, _ = self.model.recommend(
-                user_idx,
-                self._user_item[user_idx],
-                N=n + (len(exclude_seen) if exclude_seen is not None else 0),
+                user_idx, self._user_item[user_idx], N=n,
                 filter_already_liked_items=True,
             )
         except TypeError:
             items, _ = self.model.recommend(
-                user_idx,
-                self._user_item[user_idx],
-                N=n + (len(exclude_seen) if exclude_seen is not None else 0),
+                user_idx, self._user_item[user_idx], N=n,
                 filter_already_liked=True,
             )
         return np.array(items[:n])
 
     def score_all_users(self) -> np.ndarray:
-        """
-        Returns (n_users, n_items) float32 score matrix.
-        S = user_factors @ item_factors.T
-
-        user_factors: (n_users, f)  — guaranteed by shape guard in fit()
-        item_factors: (n_items, f)  — guaranteed by shape guard in fit()
-        S:            (n_users, n_items)
-        """
         print("  [ImplicitALS] computing full score matrix...")
-        U = np.asarray(self.model.user_factors, dtype=np.float32)  # (n_users, f)
-        V = np.asarray(self.model.item_factors, dtype=np.float32)  # (n_items, f)
-
-        # Redundant guard — catches any implicit version weirdness at runtime
+        U = np.asarray(self.model.user_factors, dtype=np.float32)
+        V = np.asarray(self.model.item_factors, dtype=np.float32)
         if U.shape[0] != self.n_users or V.shape[0] != self.n_items:
-            raise ValueError(
-                f"[ImplicitALS] score_all_users shape mismatch: "
-                f"U={U.shape}, V={V.shape}, "
-                f"n_users={self.n_users}, n_items={self.n_items}"
-            )
-
-        S = (U @ V.T).astype(np.float32)   # (n_users, n_items)
-
-        # Mask training items with explicit (row, col) indices
+            raise ValueError(f"[ImplicitALS] score_all_users shape mismatch")
+        S = (U @ V.T).astype(np.float32)
         rows, cols = self._user_item.nonzero()
         S[rows, cols] = -np.inf
         return S
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────
 # 3. LightGCN
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────
 class LightGCN(nn.Module):
     """
     LightGCN (He et al. 2020) — simplified GCN for collaborative filtering.
     https://arxiv.org/abs/2002.02126
 
-    Architecture:
-      - No feature transformation, no non-linear activation
-      - Propagation: e_u^(k+1) = sum_{i in N(u)} (1/sqrt(|N(u)||N(i)|)) * e_i^(k)
-      - Final embedding = mean of all layer embeddings (layer combination)
-      - BPR loss with in-batch negative sampling
-
-    n_layers=3 is the sweet spot for ML-1M per He et al. 2020.
-    embed_dim=64 balances capacity vs overfitting on 6040 users / 3706 items.
-
-    Expected NDCG@10 (80/20 holdout, ML-1M): 0.32–0.35
+    forward() accepts neg_items of shape (B,) or (B, n_neg).
+    When 2-D, BPR loss is averaged over all n_neg negatives (vectorised).
     """
 
-    def __init__(
-        self,
-        n_users: int,
-        n_items: int,
-        embed_dim: int = 64,
-        n_layers: int = 3,
-        dropout: float = 0.1,
-    ):
+    def __init__(self, n_users: int, n_items: int,
+                 embed_dim: int = 64, n_layers: int = 3, dropout: float = 0.1):
         super().__init__()
         self.n_users   = n_users
         self.n_items   = n_items
@@ -298,43 +194,39 @@ class LightGCN(nn.Module):
         self.norm_adj: Optional[torch.sparse.FloatTensor] = None
 
     def build_graph(self, interaction_matrix: csr_matrix, device: torch.device):
-        """
-        Build the symmetric normalised adjacency matrix A_hat.
-        A = [[0, R], [R^T, 0]]  (users + items as nodes)
-        A_hat = D^{-1/2} A D^{-1/2}
-        """
         print(f"  [LightGCN] building graph: {self.n_users} users, {self.n_items} items")
-        R = interaction_matrix  # (n_users, n_items)
-
+        R = interaction_matrix
         n = self.n_users + self.n_items
         row_R, col_R = R.nonzero()
         row_Rt = col_R + self.n_users
         col_Rt = row_R
-
         rows = np.concatenate([row_R,   row_Rt])
         cols = np.concatenate([col_R + self.n_users, col_Rt])
         vals = np.ones(len(rows), dtype=np.float32)
-
         A = sp.csr_matrix((vals, (rows, cols)), shape=(n, n))
-
         degree = np.array(A.sum(axis=1)).flatten()
         d_inv_sqrt = np.where(degree > 0, 1.0 / np.sqrt(degree), 0.0)
-
         A_hat = A.multiply(d_inv_sqrt[:, None]).multiply(d_inv_sqrt[None, :])
         A_hat = A_hat.tocoo().astype(np.float32)
-
         indices = torch.LongTensor(np.array([A_hat.row, A_hat.col]))
         values  = torch.FloatTensor(A_hat.data)
-        self.norm_adj = torch.sparse_coo_tensor(indices, values, (n, n), device=device)
+        self.norm_adj = torch.sparse_coo_tensor(
+            indices, values, (n, n), device=device
+        ).coalesce()
         print(f"  [LightGCN] graph built: {A_hat.nnz:,} edges")
 
     def propagate(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         LightGCN propagation: k layers, mean layer combination.
-        Returns final (n_users, embed_dim) and (n_items, embed_dim) embeddings.
+        Requires norm_adj to be set via build_graph().
+        Returns (n_users, d) and (n_items, d) final embeddings.
         """
-        E0 = torch.cat([self.user_embedding.weight, self.item_embedding.weight], dim=0)
-
+        assert self.norm_adj is not None, \
+            "norm_adj is None — call build_graph() before propagate()"
+        E0 = torch.cat([
+            self.user_embedding.weight,
+            self.item_embedding.weight,
+        ], dim=0)
         all_emb = [E0]
         E = E0
         for _ in range(self.n_layers):
@@ -342,11 +234,8 @@ class LightGCN(nn.Module):
                 E = F.dropout(E, p=self.dropout, training=True)
             E = torch.sparse.mm(self.norm_adj, E)
             all_emb.append(E)
-
-        E_final = torch.stack(all_emb, dim=1).mean(dim=1)  # (n_users+n_items, d)
-        u_emb = E_final[:self.n_users]
-        i_emb = E_final[self.n_users:]
-        return u_emb, i_emb
+        E_final = torch.stack(all_emb, dim=1).mean(dim=1)
+        return E_final[:self.n_users], E_final[self.n_users:]
 
     def forward(
         self,
@@ -354,22 +243,43 @@ class LightGCN(nn.Module):
         pos_items: torch.Tensor,
         neg_items: torch.Tensor,
     ) -> torch.Tensor:
-        """BPR loss."""
+        """
+        BPR loss.
+        neg_items: (B,) or (B, n_neg).
+        When (B, n_neg), loss is averaged over all n_neg negatives.
+        """
         u_emb, i_emb = self.propagate()
-        u   = u_emb[users]
-        pos = i_emb[pos_items]
-        neg = i_emb[neg_items]
 
-        pos_score = (u * pos).sum(dim=-1)
-        neg_score = (u * neg).sum(dim=-1)
-        bpr_loss  = -F.logsigmoid(pos_score - neg_score).mean()
+        u   = u_emb[users]      # (B, d)
+        pos = i_emb[pos_items]  # (B, d)
+        pos_score = (u * pos).sum(dim=-1)  # (B,)
 
-        # L2 reg on initial embeddings only (He et al. 2020)
-        reg_loss = (
-            self.user_embedding(users).norm(2).pow(2) +
-            self.item_embedding(pos_items).norm(2).pow(2) +
-            self.item_embedding(neg_items).norm(2).pow(2)
-        ) / len(users)
+        if neg_items.dim() == 1:
+            # Original path: single negative per sample
+            neg = i_emb[neg_items]            # (B, d)
+            neg_score = (u * neg).sum(dim=-1) # (B,)
+            bpr_loss = -F.logsigmoid(pos_score - neg_score).mean()
+            reg_loss = (
+                self.user_embedding(users).norm(2).pow(2) +
+                self.item_embedding(pos_items).norm(2).pow(2) +
+                self.item_embedding(neg_items).norm(2).pow(2)
+            ) / len(users)
+        else:
+            # n_neg path: neg_items is (B, n_neg)
+            # neg: (B, n_neg, d)
+            neg = i_emb[neg_items.view(-1)].view(
+                neg_items.size(0), neg_items.size(1), -1
+            )
+            # neg_score: (B, n_neg)
+            neg_score = torch.einsum("bd,bnd->bn", u, neg)
+            bpr_loss = -F.logsigmoid(
+                pos_score.unsqueeze(1) - neg_score
+            ).mean()
+            reg_loss = (
+                self.user_embedding(users).norm(2).pow(2) +
+                self.item_embedding(pos_items).norm(2).pow(2) +
+                self.item_embedding(neg_items.view(-1)).norm(2).pow(2)
+            ) / len(users)
 
         return bpr_loss + 1e-4 * reg_loss
 
@@ -379,197 +289,120 @@ class LightGCN(nn.Module):
         train_matrix: csr_matrix,
         batch_size: int = 512,
     ) -> np.ndarray:
-        """
-        Returns (n_users, n_items) score matrix with training items masked.
-        """
         print("  [LightGCN] computing full score matrix...")
         self.eval()
         u_emb, i_emb = self.propagate()
         scores = []
         for start in range(0, self.n_users, batch_size):
             end = min(start + batch_size, self.n_users)
-            s = (u_emb[start:end] @ i_emb.T).cpu().numpy()  # (batch, n_items)
+            s = (u_emb[start:end] @ i_emb.T).cpu().numpy()
             scores.append(s)
-        S = np.concatenate(scores, axis=0).astype(np.float32)  # (n_users, n_items)
+        S = np.concatenate(scores, axis=0).astype(np.float32)
         rows, cols = train_matrix.nonzero()
         S[rows, cols] = -np.inf
         return S
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. DAREnsemble — learned score fusion
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────
+# 4. DAREnsemble
+# ───────────────────────────────────────────────────────────────────
 class DAREnsemble:
     """
     Learns interpolation weights alpha/beta/gamma for:
       S_final = alpha * S_ease + beta * S_lightgcn + gamma * S_ials
     subject to alpha + beta + gamma = 1, all >= 0.
-
-    Optimisation: grid search over a simplex of (alpha, beta, gamma) combinations
-    evaluated on the validation set NDCG@10. Grid resolution = 0.05.
-
-    Why not gradient descent:
-      The score matrices are pre-computed and the simplex search over 231 points
-      (with step 0.05) takes < 30 seconds on CPU. Gradient descent would require
-      differentiating through the ranking operation, which needs a surrogate like
-      ListNet or NeuralNDCG — overkill for 3 models.
+    Grid search over simplex (step=0.05, 231 combinations).
     """
 
     def __init__(self):
-        self.alpha: float = 1/3   # TemporalEASE weight
-        self.beta:  float = 1/3   # LightGCN weight
-        self.gamma: float = 1/3   # iALS weight
+        self.alpha: float = 1/3
+        self.beta:  float = 1/3
+        self.gamma: float = 1/3
         self.best_ndcg: float = 0.0
 
-    def _blend(self, Sa, Sb, Sc, a, b, c) -> np.ndarray:
+    def _blend(self, Sa, Sb, Sc, a, b, c):
         return a * Sa + b * Sb + c * Sc
 
-    def fit(
-        self,
-        S_ease: np.ndarray,
-        S_lgcn: np.ndarray,
-        S_ials: np.ndarray,
-        val_ground_truth: Dict[int, set],
-        k: int = 10,
-        step: float = 0.05,
-    ):
-        from metrics import ndcg_at_k  # relative import — works from src/ context
+    def fit(self, S_ease, S_lgcn, S_ials, val_ground_truth, k=10, step=0.05):
+        from metrics import ndcg_at_k
         print(f"  [DAREnsemble] grid searching simplex (step={step})...")
-        best_ndcg = -1
-        best_weights = (1/3, 1/3, 1/3)
-
+        best_ndcg, best_weights = -1, (1/3, 1/3, 1/3)
         alphas = np.arange(0, 1 + step, step)
         n_evaluated = 0
         for a in alphas:
             for b in np.arange(0, 1 - a + step, step):
-                c = 1.0 - a - b
+                c = max(0.0, 1.0 - a - b)
                 if c < -1e-6:
                     continue
-                c = max(0.0, c)
                 S = self._blend(S_ease, S_lgcn, S_ials, a, b, c)
-
-                ndcgs = []
-                for uid, true_items in val_ground_truth.items():
-                    scores = S[uid]
-                    top_k  = np.argsort(scores)[::-1][:k].tolist()
-                    ndcgs.append(ndcg_at_k(top_k, true_items, k))
+                ndcgs = [
+                    ndcg_at_k(np.argsort(S[uid])[::-1][:k].tolist(), true_items, k)
+                    for uid, true_items in val_ground_truth.items()
+                ]
                 mean_ndcg = np.mean(ndcgs)
-
                 if mean_ndcg > best_ndcg:
-                    best_ndcg    = mean_ndcg
-                    best_weights = (a, b, c)
+                    best_ndcg, best_weights = mean_ndcg, (a, b, c)
                 n_evaluated += 1
-
         self.alpha, self.beta, self.gamma = best_weights
         self.best_ndcg = best_ndcg
         print(f"  [DAREnsemble] best weights: α={self.alpha:.2f} β={self.beta:.2f} "
               f"γ={self.gamma:.2f}  val NDCG@10={best_ndcg:.4f}  ({n_evaluated} combinations)")
         return self
 
-    def predict(
-        self,
-        S_ease: np.ndarray,
-        S_lgcn: np.ndarray,
-        S_ials: np.ndarray,
-    ) -> np.ndarray:
-        """Returns blended (n_users, n_items) score matrix."""
+    def predict(self, S_ease, S_lgcn, S_ials):
         return self._blend(S_ease, S_lgcn, S_ials, self.alpha, self.beta, self.gamma)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 5. MMRReranker — genre-diversity-aware Maximal Marginal Relevance
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────
+# 5. MMRReranker
+# ───────────────────────────────────────────────────────────────────
 class MMRReranker:
     """
-    Maximal Marginal Relevance (Carbonell & Goldstein 1998) re-ranker.
-
-    For each user, selects a top-K list that balances relevance vs diversity:
-      MMR(d) = lambda * rel(d) - (1 - lambda) * max_{d' in S} sim(d, d')
-
-    where:
-      rel(d)      = normalised recommendation score for item d
-      sim(d, d')  = genre cosine similarity between item d and already-selected d'
-      lambda      = [0, 1] trade-off: 1=pure relevance, 0=pure diversity
-      S           = already-selected items in current user's top-K
-
-    lambda=0.7 balances accuracy and diversity well on ML-1M
-    (empirically: NDCG@10 drops ~0.01-0.02, ILD@10 improves ~0.15-0.25).
+    Maximal Marginal Relevance (Carbonell & Goldstein 1998).
+    MMR(d) = lambda * rel(d) - (1-lambda) * max_{d' in S} sim(d, d')
+    lambda=0.7: balances accuracy and diversity on ML-1M.
     """
 
     def __init__(self, lambda_: float = 0.7, k: int = 10):
         self.lambda_ = lambda_
         self.k = k
-        self.genre_sim: Optional[np.ndarray] = None   # (n_items, n_items) cosine sim
+        self.genre_sim: Optional[np.ndarray] = None
 
     def build_genre_sim(self, genre_matrix: np.ndarray):
-        """
-        Pre-compute item-item genre cosine similarity matrix.
-        genre_matrix: (n_items, n_genres) float32.
-        """
         print("  [MMR] building item-item genre similarity matrix...")
         norms = np.linalg.norm(genre_matrix, axis=1, keepdims=True) + 1e-8
         G_norm = genre_matrix / norms
-        self.genre_sim = (G_norm @ G_norm.T).astype(np.float32)  # (n_items, n_items)
+        self.genre_sim = (G_norm @ G_norm.T).astype(np.float32)
         print(f"  [MMR] genre_sim: {self.genre_sim.shape}")
 
-    def rerank(
-        self,
-        score_vec: np.ndarray,
-        n_candidates: int = 50,
-    ) -> List[int]:
-        """
-        MMR re-ranking for a single user.
-        score_vec:    (n_items,) relevance scores — seen items pre-masked to -inf.
-        n_candidates: candidate pool size before MMR selection.
-        """
+    def rerank(self, score_vec: np.ndarray, n_candidates: int = 50) -> List[int]:
         valid_items = np.where(score_vec > -np.inf)[0]
         if len(valid_items) == 0:
             return []
-
         top_cands = valid_items[np.argsort(score_vec[valid_items])[::-1][:n_candidates]]
-
         cand_scores = score_vec[top_cands]
         s_min, s_max = cand_scores.min(), cand_scores.max()
-        if s_max > s_min:
-            rel = (cand_scores - s_min) / (s_max - s_min)
-        else:
-            rel = np.ones(len(top_cands))
+        rel = (cand_scores - s_min) / (s_max - s_min + 1e-8)
         rel_map = {item: float(rel[i]) for i, item in enumerate(top_cands)}
-
-        selected = []
-        remaining = list(top_cands)
-
+        selected, remaining = [], list(top_cands)
         for _ in range(self.k):
             if not remaining:
                 break
             if not selected:
                 best = max(remaining, key=lambda i: rel_map[i])
             else:
-                best_score = -np.inf
-                best = remaining[0]
+                best_score, best = -np.inf, remaining[0]
                 for item in remaining:
-                    r = rel_map[item]
                     sim_max = max(self.genre_sim[item, s] for s in selected)
-                    mmr_score = self.lambda_ * r - (1 - self.lambda_) * sim_max
+                    mmr_score = self.lambda_ * rel_map[item] - (1 - self.lambda_) * sim_max
                     if mmr_score > best_score:
-                        best_score = mmr_score
-                        best = item
+                        best_score, best = mmr_score, item
             selected.append(best)
             remaining.remove(best)
-
         return selected
 
-    def rerank_all(
-        self,
-        score_matrix: np.ndarray,
-        n_candidates: int = 50,
-    ) -> Dict[int, List[int]]:
-        """
-        Apply MMR re-ranking to all users.
-        Returns {user_idx: [top-k item list]}.
-        """
+    def rerank_all(self, score_matrix: np.ndarray,
+                   n_candidates: int = 50) -> Dict[int, List[int]]:
         print(f"  [MMR] re-ranking all {len(score_matrix)} users (λ={self.lambda_})...")
-        recommendations = {}
-        for uid in range(len(score_matrix)):
-            recommendations[uid] = self.rerank(score_matrix[uid], n_candidates)
-        return recommendations
+        return {uid: self.rerank(score_matrix[uid], n_candidates)
+                for uid in range(len(score_matrix))}
