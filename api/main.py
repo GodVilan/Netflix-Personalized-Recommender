@@ -1,5 +1,5 @@
 """
-api/main.py  —  DARE-Rec FastAPI serving layer (2026-04-10, v4)
+api/main.py  —  DARE-Rec FastAPI serving layer (2026-04-10, v4.1)
 
 Endpoints:
   GET  /recommend/{user_id}  — top-K personalized recommendations
@@ -26,17 +26,21 @@ Checkpoints expected (all written by src/run_experiment.py):
   checkpoints/scores_lgcn.npy         — (n_users, n_items) precomputed LightGCN scores
   checkpoints/scores_dare.npy         — (n_users, n_items) precomputed DARE ensemble scores
 
+v4.1 fix (2026-04-10):
+  /similar/0 (Toy Story) returned similarity=3.39 — impossible for cosine similarity.
+  Root cause: raw dot product on un-normalized embeddings. Popular items (Toy Story,
+  Star Wars) receive the most gradient updates during BPR training, resulting in
+  large embedding norms. The dot product A·B is not cosine similarity unless both
+  vectors are unit-length — it equals ||A|| * ||B|| * cos(θ), so high-norm items
+  dominate purely by magnitude, not semantic proximity.
+  Fix: L2-normalize lgcn_item_emb and lgcn_user_emb immediately after numpy
+  conversion at load time. Dot product on unit vectors = true cosine similarity,
+  guaranteed in [-1, 1]. Normalization is applied once at startup — no overhead
+  at request time. No retraining needed.
+
 v4 fix (2026-04-10):
-  /similar/{item_id} returned 500 due to 3 stacked bugs in similar_items():
-    Bug 1: (lgcn_item_emb @ query) returns a Tensor, not ndarray.
-           .numpy() was called on the result but embeddings are Tensors —
-           the matmul returns a Tensor too, and .numpy() on a grad-tracked
-           or device-mismatched tensor raises RuntimeError.
-    Bug 2: sims[item_id] = -np.inf on a Tensor raises TypeError.
-           Tensors need float('-inf'), not np.inf.
-    Bug 3: np.argsort() on a Tensor raises TypeError.
-  Fix: convert lgcn_item_emb and lgcn_user_emb to numpy arrays at load time.
-       All downstream math is then pure numpy — no tensor/numpy impedance anywhere.
+  /similar/{item_id} returned 500 due to 3 stacked tensor/numpy type bugs.
+  Fix: convert embeddings to numpy at load time. See commit 108543b for details.
 """
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -57,7 +61,7 @@ logger = logging.getLogger("dare-rec-api")
 app = FastAPI(
     title="DARE-Rec Recommendation API",
     description="TemporalEASE + LightGCN + iALS ensemble recommendation engine",
-    version="4.0.0",
+    version="4.1.0",
 )
 
 app.add_middleware(
@@ -67,7 +71,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Pydantic models ───────────────────────────────────────────────────
+# ── Pydantic models ────────────────────────────────────────────────────
 
 class RecommendationResponse(BaseModel):
     user_id: int
@@ -88,7 +92,7 @@ class SimilarItemsResponse(BaseModel):
     similar_items: List[dict]
     method: str
 
-# ── Constants ───────────────────────────────────────────────────────────
+# ── Constants ──────────────────────────────────────────────────────────
 
 CHECKPOINT_DIR = os.environ.get("CHECKPOINT_DIR", "checkpoints")
 N_ITEMS   = 3706
@@ -96,7 +100,14 @@ N_USERS   = 6040
 EMBED_DIM = 64
 N_LAYERS  = 3
 
-# ── ModelStore ──────────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────
+
+def l2_normalize(mat: np.ndarray) -> np.ndarray:
+    """Row-wise L2 normalization. After this, dot(a, b) == cosine_similarity(a, b)."""
+    norms = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-8
+    return (mat / norms).astype(np.float32)
+
+# ── ModelStore ─────────────────────────────────────────────────────────
 
 class ModelStore:
     """
@@ -104,11 +115,11 @@ class ModelStore:
 
     Priority for scoring:
       1. Precomputed score matrices (scores_*.npy) — exact offline scores, fastest
-      2. Live recompute from model weights — used only if score matrices missing
+      2. Live recompute from model weights — fallback if matrices absent
 
-    All embedding tensors are converted to numpy float32 arrays at load time.
-    This ensures every scoring and similarity path is pure numpy — no
-    tensor/numpy type impedance, no .detach()/.cpu() scatter throughout the code.
+    All embedding tensors are:
+      (a) converted to numpy float32 at load time  — no tensor/numpy impedance
+      (b) L2-normalized at load time               — dot product == cosine similarity
     """
 
     def __init__(self):
@@ -120,10 +131,10 @@ class ModelStore:
         self.S_lgcn: Optional[np.ndarray] = None
         self.S_dare: Optional[np.ndarray] = None
 
-        # Live fallback — all stored as numpy float32 (never Tensor)
+        # Live fallback — numpy float32, L2-normalized where applicable
         self.ease_B:        Optional[np.ndarray] = None  # (n_items, n_items)
-        self.lgcn_user_emb: Optional[np.ndarray] = None  # (n_users, embed_dim)
-        self.lgcn_item_emb: Optional[np.ndarray] = None  # (n_items, embed_dim)
+        self.lgcn_user_emb: Optional[np.ndarray] = None  # (n_users, embed_dim) — unit vectors
+        self.lgcn_item_emb: Optional[np.ndarray] = None  # (n_items, embed_dim) — unit vectors
         self.ials_U:        Optional[np.ndarray] = None  # (n_users, factors)
         self.ials_V:        Optional[np.ndarray] = None  # (n_items, factors)
 
@@ -145,7 +156,7 @@ class ModelStore:
         if src_dir not in sys.path:
             sys.path.insert(0, os.path.abspath(src_dir))
 
-        # ── item metadata (real movie titles) ──────────────────────────
+        # ── item metadata ──────────────────────────────────────────────
         meta_path = self._p("item_metadata.json")
         if os.path.exists(meta_path):
             with open(meta_path) as f:
@@ -155,9 +166,9 @@ class ModelStore:
             logger.info(f"item_metadata loaded: {len(self.item_metadata)} titles. Sample: {sample}")
         else:
             self.item_metadata = {i: f"Movie {i}" for i in range(N_ITEMS)}
-            logger.warning(f"item_metadata.json not found at {meta_path} — using placeholders.")
+            logger.warning(f"item_metadata.json not found — using placeholders.")
 
-        # ── precomputed score matrices (preferred) ──────────────────────
+        # ── precomputed score matrices (preferred) ─────────────────────
         for attr, fname in [
             ("S_ease", "scores_ease.npy"),
             ("S_ials", "scores_ials.npy"),
@@ -192,9 +203,12 @@ class ModelStore:
             except Exception as e:
                 logger.warning(f"Could not load iALS: {e}")
 
-        # ── live fallback: LightGCN embeddings → numpy at load time ───
-        # IMPORTANT: convert to numpy here so all downstream math (matmul,
-        # masking, argsort) is pure numpy. Never store as torch.Tensor.
+        # ── live fallback: LightGCN embeddings ────────────────────────
+        # Step 1: tensor → numpy (no more tensor/numpy impedance downstream)
+        # Step 2: L2-normalize rows so dot(a,b) == cosine_similarity(a,b)
+        #         Without this, popular items (Toy Story, Star Wars) have large
+        #         embedding norms from many gradient updates, causing dot products
+        #         of 3.39+ instead of the correct [-1, 1] cosine range.
         lgcn_path = self._p("lightgcn.pt")
         if os.path.exists(lgcn_path):
             try:
@@ -207,17 +221,19 @@ class ModelStore:
                 lgcn.load_state_dict(state)
                 lgcn.eval()
                 with torch.no_grad():
-                    # .detach().cpu().numpy() — belt-and-suspenders,
-                    # even though map_location="cpu" already moved weights to CPU.
-                    self.lgcn_user_emb = (
-                        lgcn.user_embedding.weight.detach().cpu().numpy().astype(np.float32)
-                    )
-                    self.lgcn_item_emb = (
-                        lgcn.item_embedding.weight.detach().cpu().numpy().astype(np.float32)
-                    )
+                    raw_item = lgcn.item_embedding.weight.detach().cpu().numpy().astype(np.float32)
+                    raw_user = lgcn.user_embedding.weight.detach().cpu().numpy().astype(np.float32)
+
+                # L2-normalize: after this, all dot products are true cosine similarities
+                self.lgcn_item_emb = l2_normalize(raw_item)
+                self.lgcn_user_emb = l2_normalize(raw_user)
+
+                # Sanity check: norms should all be ~1.0
+                item_norms = np.linalg.norm(self.lgcn_item_emb, axis=1)
                 logger.info(
-                    f"LightGCN embeddings loaded as numpy: "
-                    f"user={self.lgcn_user_emb.shape}, item={self.lgcn_item_emb.shape}"
+                    f"LightGCN embeddings loaded + L2-normalized: "
+                    f"item={self.lgcn_item_emb.shape}, user={self.lgcn_user_emb.shape} | "
+                    f"item norm mean={item_norms.mean():.4f} min={item_norms.min():.4f} max={item_norms.max():.4f}"
                 )
             except Exception as e:
                 logger.warning(f"Could not load LightGCN: {e}")
@@ -235,7 +251,7 @@ class ModelStore:
             except Exception as e:
                 logger.warning(f"Could not load ensemble weights: {e}")
 
-    # ── readiness ──────────────────────────────────────────────────
+    # ── readiness ──────────────────────────────────────────────────────
 
     def is_ready(self, model: str) -> bool:
         if model == "ease":
@@ -248,7 +264,7 @@ class ModelStore:
             return self.S_dare is not None or self.ease_B is not None
         return False
 
-    # ── scoring helpers ────────────────────────────────────────────
+    # ── scoring helpers ────────────────────────────────────────────────
 
     def _normalize(self, s: np.ndarray) -> np.ndarray:
         lo, hi = s.min(), s.max()
@@ -264,7 +280,7 @@ class ModelStore:
         if mat is not None:
             return mat[user_id]
 
-        # 2. Live recompute fallback (all numpy — no tensor ops)
+        # 2. Live recompute fallback (pure numpy)
         if model == "ease":
             if self.ease_B is not None:
                 return self.ease_B.diagonal()
@@ -277,7 +293,7 @@ class ModelStore:
 
         if model == "lgcn":
             if self.lgcn_user_emb is not None:
-                # Pure numpy matmul — lgcn_user_emb is np.ndarray (converted at load)
+                # Both are L2-normalized → dot product == cosine similarity
                 return self.lgcn_item_emb @ self.lgcn_user_emb[user_id]
             return np.zeros(N_ITEMS, dtype=np.float32)
 
@@ -306,7 +322,7 @@ class ModelStore:
             for i in top
         ]
 
-    # ── public recommend ──────────────────────────────────────────
+    # ── public recommend ───────────────────────────────────────────────
 
     def recommend(self, user_id: int, k: int, model: str) -> List[dict]:
         if model not in ("ease", "lgcn", "ials", "dare"):
@@ -317,21 +333,21 @@ class ModelStore:
         scores = self._get_scores(user_id, model)
         return self._top_k(scores, k)
 
-    # ── similar items ──────────────────────────────────────────────
+    # ── similar items ──────────────────────────────────────────────────
 
     def similar_items(self, item_id: int, k: int) -> tuple:
         """
         Returns (items_list, method_str).
 
         Priority: LightGCN embeddings → iALS item factors → EASE B column.
-        All arrays are numpy at this point — no tensor ops needed.
+        LightGCN embeddings are L2-normalized at load time, so
+        dot(a, b) here is true cosine similarity in [-1, 1].
         """
         if self.lgcn_item_emb is not None:
-            # lgcn_item_emb is np.ndarray (n_items, embed_dim) — converted at load
-            query = self.lgcn_item_emb[item_id]          # (embed_dim,) ndarray
-            sims  = self.lgcn_item_emb @ query            # (n_items,)  ndarray — pure numpy
-            sims[item_id] = -np.inf                       # exclude self — works on ndarray
-            top_k = np.argsort(sims)[::-1][:k]           # works on ndarray
+            query         = self.lgcn_item_emb[item_id]   # unit vector (embed_dim,)
+            sims          = self.lgcn_item_emb @ query     # cosine sims (n_items,)
+            sims[item_id] = -np.inf                        # exclude self
+            top_k         = np.argsort(sims)[::-1][:k]
             items = [
                 {
                     "item_id":    int(i),
@@ -361,7 +377,7 @@ class ModelStore:
         if self.ease_B is not None:
             sims          = self.ease_B[:, item_id].copy()
             sims[item_id] = -np.inf
-            top_k = np.argsort(sims)[::-1][:k]
+            top_k         = np.argsort(sims)[::-1][:k]
             items = [
                 {
                     "item_id":    int(i),
@@ -378,7 +394,7 @@ class ModelStore:
 store = ModelStore()
 feedback_buffer: list = []
 
-# ── Routes ────────────────────────────────────────────────────────────
+# ── Routes ─────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
