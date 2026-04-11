@@ -72,11 +72,6 @@ def split_data_holdout(ratings: pd.DataFrame, test_ratio: float = 0.2, seed: int
 
     Guarantees each user has at least 1 item in train, val, and test.
     Users with < 5 ratings are placed entirely in train.
-
-    FIX (audit): rng.shuffle() on a plain Python list is supported in numpy
-    ≥1.23 but the behaviour is implementation-defined for lists (it converts
-    internally). Using rng.permutation(len(idx)) and indexing is unambiguous
-    and works across all numpy versions from 1.17+.
     """
     rng = np.random.default_rng(seed)
     train_rows, val_rows, test_rows = [], [], []
@@ -86,7 +81,6 @@ def split_data_holdout(ratings: pd.DataFrame, test_ratio: float = 0.2, seed: int
         if len(idx) < 5:
             train_rows.extend(idx)
             continue
-        # version-safe shuffle via permutation
         perm = rng.permutation(len(idx))
         idx  = [idx[i] for i in perm]
 
@@ -129,3 +123,20 @@ def get_genre_features(movies: pd.DataFrame, item_enc: LabelEncoder):
                 if g in genre_to_idx:
                     features[idx, genre_to_idx[g]] = 1.0
     return features, all_genres
+
+
+def get_item_metadata(movies: pd.DataFrame, item_enc: LabelEncoder) -> dict:
+    """
+    Build {item_idx (int): title (str)} mapping in item_enc order.
+    Used by api/main.py to return real movie titles instead of 'Movie 2651'.
+
+    Example output:
+      {0: 'Toy Story (1995)', 1: 'Jumanji (1995)', ...}
+
+    Saved to checkpoints/item_metadata.json by run_experiment.py.
+    """
+    mid_to_title = movies.set_index("movie_id")["title"].to_dict()
+    return {
+        int(idx): mid_to_title.get(int(mid), f"Movie {idx}")
+        for idx, mid in enumerate(item_enc.classes_)
+    }

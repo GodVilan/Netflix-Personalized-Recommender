@@ -9,7 +9,7 @@ Pipeline:
   5. DAREnsemble: grid search α/β/γ on val NDCG@10
   6. MMRReranker: genre-diverse re-ranking on ensemble scores
   7. Full evaluation: NDCG@10, Recall@10, HitRate@10, ILD@10, Coverage, Novelty
-  8. Save checkpoints + results.json + README benchmark table
+  8. Save checkpoints + results.json + item_metadata.json
 
 Usage:
   python src/run_experiment.py --data_dir ml-1m/
@@ -19,8 +19,8 @@ Expected test NDCG@10 (80/20 holdout, all 6040 users):
   TemporalEASE   ~0.33-0.34
   ImplicitALS    ~0.28-0.31
   LightGCN       ~0.32-0.35
-  DAREnsemble    ~0.35-0.38   ← SOTA target
-  DARE+MMR       ~0.33-0.36   ← slightly lower NDCG, higher ILD
+  DAREnsemble    ~0.35-0.38   <- SOTA target
+  DARE+MMR       ~0.33-0.36   <- slightly lower NDCG, higher ILD
 """
 
 import argparse
@@ -36,7 +36,7 @@ from ab_testing      import RecommendationExperiment
 from data_processing import (
     load_movielens, encode_ids,
     build_interaction_matrix, build_temporal_interaction_matrix,
-    split_data_holdout, get_genre_features,
+    split_data_holdout, get_genre_features, get_item_metadata,
 )
 from models import (
     TemporalEASE, ImplicitALS, LightGCN, DAREnsemble, MMRReranker,
@@ -155,6 +155,9 @@ def main():
     n_genres = len(genre_names)
     print(f"  Genres: {n_genres}")
 
+    # Build item metadata for API title lookup
+    item_metadata = get_item_metadata(movies, item_enc)
+
     # Ground truth dicts
     test_gt = test_df.groupby("user_idx")["item_idx"].apply(set).to_dict()
     val_gt  = val_df.groupby("user_idx")["item_idx"].apply(set).to_dict()
@@ -201,7 +204,7 @@ def main():
 
     def val_fn_lgcn(m):
         S = m.score_all_users(train_binary, batch_size=512)
-        val_users = list(val_gt.keys())[:1000]  # fast val on 1000 users
+        val_users = list(val_gt.keys())[:1000]
         ndcgs = [
             ndcg_at_k(np.argsort(S[u])[::-1][:10].tolist(), val_gt[u], 10)
             for u in val_users if u in val_gt
@@ -247,7 +250,6 @@ def main():
             S, test_gt, genre_matrix, item_popularity, n_items, label=label
         )
 
-    # DARE+MMR uses pre-built recs dict
     mmr_metrics = evaluate_recommendations(
         recommendations=mmr_recs,
         ground_truth=test_gt,
@@ -272,27 +274,50 @@ def main():
     print("DARE-Rec is the first system to report all 5 metrics jointly.")
 
     # ── Save ─────────────────────────────────────────────────────────────────
-    output = {"models": results, "ensemble_weights": {
-        "alpha_ease": ensemble.alpha,
-        "beta_lightgcn": ensemble.beta,
-        "gamma_ials": ensemble.gamma,
-    }, "ab_test": ab_results}
-    with open("results.json", "w") as f:
-        json.dump(output, f, indent=2)
-
     os.makedirs("checkpoints", exist_ok=True)
+
+    # Model checkpoints
     torch.save(lgcn.state_dict(), "checkpoints/lightgcn.pt")
     np.savez("checkpoints/ease_B.npz", B=ease.B)
-    np.savez("checkpoints/ials_factors.npz",
-             user_factors=np.array(ials.model.user_factors),
-             item_factors=np.array(ials.model.item_factors))
+    np.savez(
+        "checkpoints/ials_factors.npz",
+        user_factors=np.asarray(ials.model.user_factors, dtype=np.float32),
+        item_factors=np.asarray(ials.model.item_factors, dtype=np.float32),
+    )
     np.save("checkpoints/genre_matrix.npy", genre_matrix)
+
+    # Ensemble weights
     with open("checkpoints/ensemble_weights.json", "w") as f:
-        json.dump({"alpha": ensemble.alpha, "beta": ensemble.beta, "gamma": ensemble.gamma}, f)
+        json.dump({
+            "alpha": ensemble.alpha,
+            "beta":  ensemble.beta,
+            "gamma": ensemble.gamma,
+        }, f, indent=2)
+
+    # Item metadata — real movie titles for API responses
+    with open("checkpoints/item_metadata.json", "w") as f:
+        json.dump(item_metadata, f)
+    print(f"  Saved item_metadata.json ({len(item_metadata):,} titles)")
+
+    # Full results — saved in both root and checkpoints/ so /metrics finds it
+    output = {
+        "models": results,
+        "ensemble_weights": {
+            "alpha_ease":    ensemble.alpha,
+            "beta_lightgcn": ensemble.beta,
+            "gamma_ials":    ensemble.gamma,
+        },
+        "ab_test": ab_results,
+    }
+    for path in ["results.json", "checkpoints/metrics.json"]:
+        with open(path, "w") as f:
+            json.dump(output, f, indent=2)
 
     print("\n✔ results.json saved")
-    print("✔ checkpoints/ saved")
-    print("✔ API: uvicorn api.main:app --reload --port 8000")
+    print("✔ checkpoints/ saved (lightgcn.pt, ease_B.npz, ials_factors.npz,")
+    print("                      genre_matrix.npy, ensemble_weights.json,")
+    print("                      item_metadata.json, metrics.json)")
+    print("✔ API: uvicorn api.main:app --host 0.0.0.0 --port 8000")
     print("Done.")
 
 
