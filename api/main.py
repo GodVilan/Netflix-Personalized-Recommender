@@ -1,5 +1,5 @@
 """
-api/main.py  —  DARE-Rec FastAPI serving layer (2026-04-10, v4.3)
+api/main.py  —  DARE-Rec FastAPI serving layer (2026-04-10, v4.4)
 
 Endpoints:
   GET  /recommend/{user_id}  — top-K personalized recommendations
@@ -14,50 +14,46 @@ Models served:
   lgcn  — LightGCN only
   ials  — ImplicitALS only
 
-v4.3 fix (2026-04-10)  — correct TAIL_NORM_THRESHOLD to 0.05
-  The v4.2 threshold of 1e-3 was below the minimum embedding norm in the
-  entire ML-1M checkpoint (min=0.0049), so zero items were flagged as tail.
+v4.4 fix (2026-04-10)  — load propagated LightGCN embeddings for /similar
+  Root cause of cosine≈1.0 on /similar (confirmed via embedding diagnostics):
 
-  Empirical norm distribution on this checkpoint:
-    min=0.0049  p1=0.0080  p5=0.0167  p10=0.0306
-    median=0.1595  p90=0.7947  max=2.1048
+  LightGCN's actual item representations are:
+    E_final = mean(E0, A_hat@E0, A_hat^2@E0, A_hat^3@E0)
+  where A_hat is the normalized user-item bipartite adjacency matrix.
 
-  The real tail cluster sits below p5 (~0.017). A threshold of 0.05
-  captures all genuinely undertrained items (norm < 3× the p5 value)
-  without being aggressive enough to block items with real signal.
-  This flags ~185 items (~5% of catalog).
+  api/main.py was loading only lightgcn.pt (which contains E0 — the base
+  learnable embedding weight) and calling l2_normalize(E0). A_hat is not
+  stored in the checkpoint; the API has no interaction matrix at serve time
+  and cannot reconstruct it. So propagate() was never called, and all
+  similarity was computed on raw E0.
 
-  Verified: item_id=587 (Outside Ozona) and the 10 lowest-norm items
-  (norms 0.0049–0.0064) all fall below 0.05 and will now return HTTP 422
-  from /similar instead of cosine≈1.0 garbage neighbors.
+  Diagnostics confirmed the collapse:
+    - median pairwise cosine on E0 = 0.84  (should be ~0.05-0.15)
+    - 42.5% of random items have cosine > 0.999 with some other item
+    - p90 pairwise cosine = 0.9985
+  This is NOT undertrained weights — BPR did run. E0 simply lacks the
+  neighborhood-aggregation signal that makes LightGCN representations
+  discriminative.
 
-v4.2 fix (2026-04-10)  — tail-item similarity guard
-  Root cause: sparse/long-tail items receive almost zero gradient signal
-  during BPR training, so their embeddings barely move from random init.
-  After L2 normalization, near-zero vectors all collapse to nearly the
-  same unit direction, producing cosine ≈ 1.0 neighbors that are
-  semantically meaningless (e.g. item_id=587 → Outside Ozona, Bloody
-  Child, Tarantella — unrelated films with ~1 interaction each).
+  Fix (two parts):
+    1. run_experiment.py now calls lgcn.propagate() immediately after
+       training (while norm_adj is live), extracts E_final, L2-normalizes,
+       and saves to checkpoints/lgcn_item_emb.npy + lgcn_user_emb.npy.
+    2. This file (v4.4) loads those .npy files directly at startup.
+       Falls back to E0 with a loud WARNING if they don’t exist (i.e.,
+       the checkpoint was produced by run_experiment.py v3 or earlier).
 
-  Two-layer defence:
-    1. Popularity floor  — /similar rejects items whose pre-norm embedding
-       norm is below TAIL_NORM_THRESHOLD. These items never had enough
-       training signal to learn a meaningful direction.
-       Returns HTTP 422 with a clear explanation.
-    2. Neighbor dedup guard  — after scoring, any neighbor whose pre-norm
-       norm is below threshold is filtered out of the result list.
-       Protects against clusters of tail items that all collapsed to the
-       same unit vector appearing as neighbors of valid items.
+  The /health endpoint now reports lgcn_emb_source so the operator can
+  confirm which path is active.
 
-  The raw (pre-normalization) norms are stored in lgcn_item_norms and
-  lgcn_user_norms at load time so the check is O(1) per request.
+v4.3 fix (2026-04-10)  — calibrate TAIL_NORM_THRESHOLD to 0.05
+  Empirical norm distribution: min=0.0049, p5=0.0167, median=0.1595.
+  Previous 1e-3 was below the minimum, catching 0 items.
+  Note: tail norm guard is kept but is secondary to the propagation fix.
 
+v4.2 fix (2026-04-10)  — two-layer tail-item guard in /similar
 v4.1 fix (2026-04-10)  — L2-normalize embeddings at load time
-  dot(a,b) on unit vectors == cosine similarity ∈ [-1,1].
-  Fixes item_id=0 returning similarity=3.39.
-
-v4 fix (2026-04-10)  — tensor/numpy type impedance in similar_items()
-  Convert LightGCN embeddings to numpy at load time.
+v4   fix (2026-04-10)  — tensor/numpy type impedance
 """
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -78,7 +74,7 @@ logger = logging.getLogger("dare-rec-api")
 app = FastAPI(
     title="DARE-Rec Recommendation API",
     description="TemporalEASE + LightGCN + iALS ensemble recommendation engine",
-    version="4.3.0",
+    version="4.4.0",
 )
 
 app.add_middleware(
@@ -117,15 +113,9 @@ N_USERS            = 6040
 EMBED_DIM          = 64
 N_LAYERS           = 3
 
-# Items whose pre-normalization embedding norm is below this threshold
-# never received meaningful gradient signal during BPR training.
-# Their L2-normalized vectors are numerically arbitrary and cosine
-# similarity between them is meaningless.
-#
-# Calibrated from empirical norm distribution on this checkpoint:
-#   min=0.0049  p5=0.0167  median=0.1595
-# 0.05 sits between p5 and p10 (0.0306), capturing the genuine tail
-# cluster (~5% of items, ~185 items) without over-blocking.
+# Tail-item guard: items whose E0 norm is below threshold are still filtered
+# as neighbors even after the propagation fix, since propagation amplifies
+# but does not fully correct near-zero base embeddings.
 TAIL_NORM_THRESHOLD = 0.05
 
 # ── Helpers ────────────────────────────────────────────────────────────
@@ -141,14 +131,20 @@ class ModelStore:
     """
     Loads DARE-Rec checkpoints at startup.
 
-    Scoring priority:
+    LightGCN embedding loading priority (v4.4):
+      1. lgcn_item_emb.npy + lgcn_user_emb.npy  [PREFERRED]
+         Propagated E_final = mean(E0..EL), L2-normalized.
+         Produced by run_experiment.py v4+.
+         These are the real LightGCN representations.
+
+      2. lightgcn.pt state_dict (E0 only)  [FALLBACK, DEGRADED]
+         Raw base embeddings before graph propagation.
+         Logs a WARNING. /similar results will be low quality.
+         Only used if .npy files are absent (old checkpoint).
+
+    Scoring priority for /recommend:
       1. Precomputed score matrices (scores_*.npy)  — exact, O(1) lookup
       2. Live recompute from weights                — fallback
-
-    Embedding hygiene (LightGCN):
-      (a) tensor → numpy float32 at load time   (no downstream tensor ops)
-      (b) raw norms stored before normalization  (tail-item guard)
-      (c) L2-normalized                         (dot == cosine similarity)
     """
 
     def __init__(self):
@@ -161,16 +157,18 @@ class ModelStore:
         self.S_dare: Optional[np.ndarray] = None
 
         # Live fallback — numpy float32
-        self.ease_B:        Optional[np.ndarray] = None  # (n_items, n_items)
-        self.lgcn_user_emb: Optional[np.ndarray] = None  # (n_users, embed_dim)  unit vectors
-        self.lgcn_item_emb: Optional[np.ndarray] = None  # (n_items, embed_dim)  unit vectors
-        self.ials_U:        Optional[np.ndarray] = None  # (n_users, factors)
-        self.ials_V:        Optional[np.ndarray] = None  # (n_items, factors)
+        self.ease_B:        Optional[np.ndarray] = None
+        self.lgcn_user_emb: Optional[np.ndarray] = None  # (n_users, d) unit vectors
+        self.lgcn_item_emb: Optional[np.ndarray] = None  # (n_items, d) unit vectors
+        self.ials_U:        Optional[np.ndarray] = None
+        self.ials_V:        Optional[np.ndarray] = None
 
-        # Pre-normalization norms — used by tail-item guard
-        self.lgcn_item_norms: Optional[np.ndarray] = None  # (n_items,)
-        self.lgcn_user_norms: Optional[np.ndarray] = None  # (n_users,)
+        # E0 norms — used by tail-item neighbor filter
+        self.lgcn_item_norms: Optional[np.ndarray] = None
         self.n_tail_items: int = 0
+
+        # Source flag for /health diagnostics
+        self.lgcn_emb_source: str = "not_loaded"
 
         # Ensemble weights
         self.alpha: float = 0.9
@@ -232,37 +230,69 @@ class ModelStore:
             except Exception as e:
                 logger.warning(f"iALS load failed: {e}")
 
-        # LightGCN — tensor→numpy, store raw norms, then L2-normalize
-        lgcn_path = self._p("lightgcn.pt")
-        if os.path.exists(lgcn_path):
-            try:
-                from models import LightGCN
-                lgcn = LightGCN(n_users=N_USERS, n_items=N_ITEMS,
-                                embed_dim=EMBED_DIM, n_layers=N_LAYERS)
-                state = torch.load(lgcn_path, map_location="cpu", weights_only=True)
-                lgcn.load_state_dict(state)
-                lgcn.eval()
-                with torch.no_grad():
-                    raw_item = lgcn.item_embedding.weight.detach().cpu().numpy().astype(np.float32)
-                    raw_user = lgcn.user_embedding.weight.detach().cpu().numpy().astype(np.float32)
+        # ──────────────────────────────────────────────────────────────
+        # LightGCN embeddings — prefer propagated .npy, fall back to E0
+        # ──────────────────────────────────────────────────────────────
+        item_emb_path = self._p("lgcn_item_emb.npy")
+        user_emb_path = self._p("lgcn_user_emb.npy")
 
-                # Store pre-norm norms for tail-item guard
-                self.lgcn_item_norms = np.linalg.norm(raw_item, axis=1)  # (n_items,)
-                self.lgcn_user_norms = np.linalg.norm(raw_user, axis=1)  # (n_users,)
-
-                # L2-normalize: dot product == cosine similarity
-                self.lgcn_item_emb = l2_normalize(raw_item)
-                self.lgcn_user_emb = l2_normalize(raw_user)
-
-                self.n_tail_items = int((self.lgcn_item_norms < TAIL_NORM_THRESHOLD).sum())
-                logger.info(
-                    f"LightGCN loaded: item={self.lgcn_item_emb.shape}, "
-                    f"user={self.lgcn_user_emb.shape} | "
-                    f"tail items (norm<{TAIL_NORM_THRESHOLD}): {self.n_tail_items}/{N_ITEMS} "
-                    f"({100*self.n_tail_items/N_ITEMS:.1f}%) — /similar will return 422 for these"
-                )
-            except Exception as e:
-                logger.warning(f"LightGCN load failed: {e}")
+        if os.path.exists(item_emb_path) and os.path.exists(user_emb_path):
+            # PRIMARY PATH: propagated + L2-normalized embeddings from run_experiment.py v4
+            self.lgcn_item_emb = np.load(item_emb_path).astype(np.float32)
+            self.lgcn_user_emb = np.load(user_emb_path).astype(np.float32)
+            self.lgcn_emb_source = "propagated"
+            logger.info(
+                f"LightGCN propagated embeddings loaded: "
+                f"item={self.lgcn_item_emb.shape}, user={self.lgcn_user_emb.shape} "
+                f"[source: lgcn_item_emb.npy — CORRECT]"
+            )
+            # E0 norms for tail-item neighbor filter
+            # Load E0 weights just to get norms (not used for similarity)
+            lgcn_pt = self._p("lightgcn.pt")
+            if os.path.exists(lgcn_pt):
+                try:
+                    from models import LightGCN
+                    lgcn = LightGCN(n_users=N_USERS, n_items=N_ITEMS,
+                                    embed_dim=EMBED_DIM, n_layers=N_LAYERS)
+                    state = torch.load(lgcn_pt, map_location="cpu", weights_only=True)
+                    lgcn.load_state_dict(state)
+                    with torch.no_grad():
+                        raw_item = lgcn.item_embedding.weight.detach().cpu().numpy()
+                    self.lgcn_item_norms = np.linalg.norm(raw_item, axis=1)
+                    self.n_tail_items = int((self.lgcn_item_norms < TAIL_NORM_THRESHOLD).sum())
+                    logger.info(f"E0 norms loaded for tail filter: {self.n_tail_items} tail items")
+                except Exception as e:
+                    logger.warning(f"E0 norm load failed (tail filter disabled): {e}")
+        else:
+            # FALLBACK PATH: E0 only — /similar quality will be degraded
+            logger.warning(
+                "lgcn_item_emb.npy not found. Falling back to raw E0 embeddings. "
+                "Run run_experiment.py v4+ to generate propagated embeddings. "
+                "/similar results will be low quality until then."
+            )
+            lgcn_path = self._p("lightgcn.pt")
+            if os.path.exists(lgcn_path):
+                try:
+                    from models import LightGCN
+                    lgcn = LightGCN(n_users=N_USERS, n_items=N_ITEMS,
+                                    embed_dim=EMBED_DIM, n_layers=N_LAYERS)
+                    state = torch.load(lgcn_path, map_location="cpu", weights_only=True)
+                    lgcn.load_state_dict(state)
+                    lgcn.eval()
+                    with torch.no_grad():
+                        raw_item = lgcn.item_embedding.weight.detach().cpu().numpy().astype(np.float32)
+                        raw_user = lgcn.user_embedding.weight.detach().cpu().numpy().astype(np.float32)
+                    self.lgcn_item_norms = np.linalg.norm(raw_item, axis=1)
+                    self.lgcn_item_emb = l2_normalize(raw_item)
+                    self.lgcn_user_emb = l2_normalize(raw_user)
+                    self.n_tail_items = int((self.lgcn_item_norms < TAIL_NORM_THRESHOLD).sum())
+                    self.lgcn_emb_source = "e0_fallback"
+                    logger.warning(
+                        f"LightGCN E0 fallback loaded: item={self.lgcn_item_emb.shape} "
+                        f"[DEGRADED — no graph propagation]"
+                    )
+                except Exception as e:
+                    logger.warning(f"LightGCN fallback load failed: {e}")
 
         # ensemble weights
         ew_path = self._p("ensemble_weights.json")
@@ -287,7 +317,6 @@ class ModelStore:
         return False
 
     def is_tail_item(self, item_id: int) -> bool:
-        """True if the item's pre-normalization embedding norm is below threshold."""
         if self.lgcn_item_norms is None:
             return False
         return bool(self.lgcn_item_norms[item_id] < TAIL_NORM_THRESHOLD)
@@ -303,7 +332,6 @@ class ModelStore:
                "lgcn": self.S_lgcn, "dare": self.S_dare}.get(model)
         if mat is not None:
             return mat[user_id]
-
         if model == "ease":
             return self.ease_B.diagonal() if self.ease_B is not None else np.zeros(N_ITEMS, dtype=np.float32)
         if model == "ials":
@@ -312,8 +340,8 @@ class ModelStore:
             return self.lgcn_item_emb @ self.lgcn_user_emb[user_id] if self.lgcn_user_emb is not None else np.zeros(N_ITEMS, dtype=np.float32)
         if model == "dare":
             s = np.zeros(N_ITEMS, dtype=np.float32)
-            if self.ease_B is not None:    s += self.alpha * self._normalize(self.ease_B.diagonal())
-            if self.ials_U is not None:    s += self.gamma * self._normalize(self.ials_U[user_id] @ self.ials_V.T)
+            if self.ease_B is not None:        s += self.alpha * self._normalize(self.ease_B.diagonal())
+            if self.ials_U is not None:        s += self.gamma * self._normalize(self.ials_U[user_id] @ self.ials_V.T)
             if self.lgcn_user_emb is not None: s += self.beta  * self._normalize(self.lgcn_item_emb @ self.lgcn_user_emb[user_id])
             return s
         return np.zeros(N_ITEMS, dtype=np.float32)
@@ -328,25 +356,11 @@ class ModelStore:
             raise HTTPException(400, f"Unknown model '{model}'. Use: dare | ease | lgcn | ials")
         return self._top_k(self._get_scores(user_id, model), k)
 
-    # ── similar items — with tail-item guard ─────────────────────────
+    # ── similar items ─────────────────────────────────────────────────────
 
     def similar_items(self, item_id: int, k: int) -> tuple:
-        """
-        Returns (items_list, method_str).
-
-        Tail-item guard: if the query item's pre-normalization embedding norm
-        is below TAIL_NORM_THRESHOLD, raises HTTP 422. These items never had
-        enough interaction data for BPR to learn a meaningful embedding
-        direction. After L2 normalization their vectors are arbitrary unit
-        vectors, and cosine similarity to other tail items will be ≈ 1.0
-        for meaningless reasons (all near-zero vectors collapse to the same
-        direction after normalization).
-
-        Neighbor guard: any neighbor that is itself a tail item is filtered
-        from the result list, even if the query item passes the norm check.
-        """
         if self.lgcn_item_emb is not None:
-            # Tail-item guard — query item
+            # Tail-item guard on query item
             if self.is_tail_item(item_id):
                 title = self.item_metadata.get(item_id, f"Movie {item_id}")
                 norm  = float(self.lgcn_item_norms[item_id])
@@ -354,27 +368,25 @@ class ModelStore:
                     status_code=422,
                     detail=(
                         f"Item {item_id} ('{title}') is a tail item: "
-                        f"embedding norm={norm:.6f} < threshold={TAIL_NORM_THRESHOLD}. "
-                        f"This item has too few interactions for LightGCN to learn a "
-                        f"meaningful embedding. Use a more popular item or add "
-                        f"?fallback=ials to use iALS similarity instead."
+                        f"E0 embedding norm={norm:.6f} < threshold={TAIL_NORM_THRESHOLD}. "
+                        f"Too few interactions for BPR to learn a meaningful embedding."
                     ),
                 )
 
-            query = self.lgcn_item_emb[item_id]    # unit vector
-            sims  = self.lgcn_item_emb @ query     # cosine sims
-            sims[item_id] = -np.inf                # exclude self
+            query = self.lgcn_item_emb[item_id]
+            sims  = self.lgcn_item_emb @ query
+            sims[item_id] = -np.inf
 
-            # Filter tail neighbors before ranking
+            # Filter E0-tail neighbors
             if self.lgcn_item_norms is not None:
-                tail_mask = self.lgcn_item_norms < TAIL_NORM_THRESHOLD
-                sims[tail_mask] = -np.inf
+                sims[self.lgcn_item_norms < TAIL_NORM_THRESHOLD] = -np.inf
 
             top_k = np.argsort(sims)[::-1][:k]
             items = [{"item_id": int(i), "similarity": round(float(sims[i]), 4),
                       "title": self.item_metadata.get(int(i), f"Movie {i}")}
                      for i in top_k if sims[i] > -np.inf]
-            return items, "cosine_lightgcn"
+            method = f"cosine_lightgcn_{self.lgcn_emb_source}"
+            return items, method
 
         if self.ials_V is not None:
             q    = self.ials_V[item_id]
@@ -406,13 +418,14 @@ feedback_buffer: list = []
 def health():
     return {
         "status": "ok",
-        "version": "4.3.0",
+        "version": "4.4.0",
         "timestamp": time.time(),
         "models": {m: store.is_ready(m) for m in ("ease", "lgcn", "ials", "dare")},
         "ensemble_weights": {"alpha_ease": store.alpha, "beta_lgcn": store.beta, "gamma_ials": store.gamma},
         "titles_loaded": len(store.item_metadata) > 100,
         "score_matrices": {"ease": store.S_ease is not None, "ials": store.S_ials is not None,
                            "lgcn": store.S_lgcn is not None, "dare": store.S_dare is not None},
+        "lgcn_emb_source": store.lgcn_emb_source,
         "tail_item_stats": {
             "threshold": TAIL_NORM_THRESHOLD,
             "n_tail_items": store.n_tail_items,

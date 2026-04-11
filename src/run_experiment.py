@@ -1,5 +1,5 @@
 """
-run_experiment.py  —  DARE-Rec full experiment (2026-04-10, v3)
+run_experiment.py  —  DARE-Rec full experiment (2026-04-10, v4)
 
 Pipeline:
   1. Load MovieLens-1M, 80/20 holdout split
@@ -15,9 +15,22 @@ Usage:
   python src/run_experiment.py --data_dir ml-1m/
   python src/run_experiment.py --data_dir ml-1m/ --skip_ab
 
-New in v3:
+New in v4 (2026-04-10):
+  After training LightGCN, materialize and save the PROPAGATED embeddings:
+    checkpoints/lgcn_item_emb.npy  — (n_items, embed_dim) L2-normalized
+    checkpoints/lgcn_user_emb.npy  — (n_users, embed_dim) L2-normalized
+
+  These are E_final = mean(E0..EL) from lgcn.propagate(), which requires
+  norm_adj to be live (it is, immediately after training). The API loads
+  these files directly instead of re-running propagate() without a graph.
+
+  Without this fix, api/main.py was using raw E0 (base embeddings before
+  any graph propagation) for /similar, producing cosine ≈1.0 for unrelated
+  items because E0 alone has near-zero discriminative information.
+
+New in v3 (2026-04-10):
   Saves scores_ease.npy, scores_ials.npy, scores_lgcn.npy, scores_dare.npy
-  so api/main.py v3 can return exact training-time scores without recomputing.
+  so api/main.py can return exact training-time scores without recomputing.
 """
 
 import argparse
@@ -45,7 +58,13 @@ from metrics import (
 from trainer import train_lightgcn, BPRDataset, get_device
 
 
-# ─── helpers ─────────────────────────────────────────────────────────────────
+# ─── helpers ──────────────────────────────────────────────────────────────
+
+def l2_normalize(mat: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-8
+    return (mat / norms).astype(np.float32)
+
+
 def scores_to_recs(score_matrix: np.ndarray, k: int = 10) -> dict:
     recs = {}
     for uid in range(len(score_matrix)):
@@ -94,7 +113,7 @@ def simulate_ab_test(n_rounds: int = 20000) -> dict:
     return experiment.summary()
 
 
-# ─── main ────────────────────────────────────────────────────────────────────
+# ─── main ──────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir",    default="ml-1m/")
@@ -113,7 +132,7 @@ def main():
 
     device = get_device()
 
-    # ── A/B test simulation ──────────────────────────────────────────────────
+    # ── A/B test simulation ─────────────────────────────────────────────
     ab_results = {}
     if not args.skip_ab:
         print("\n[1/7] A/B test simulation (Thompson Sampling)...")
@@ -121,7 +140,7 @@ def main():
         ctr = ab_results["significance_tests"]["ctr"]
         print(f"  CTR lift: {ctr['relative_lift_pct']:.2f}%  (p={ctr['p_value']}, significant={ctr['significant']})")
 
-    # ── Data ─────────────────────────────────────────────────────────────────
+    # ── Data ──────────────────────────────────────────────────────────────
     print("\n[2/7] Loading MovieLens-1M...")
     ratings_path = os.path.join(args.data_dir, "ratings.dat")
     movies_path  = os.path.join(args.data_dir, "movies.dat")
@@ -152,21 +171,21 @@ def main():
     train_binary   = build_interaction_matrix(train_df, n_users, n_items)
     train_temporal = build_temporal_interaction_matrix(train_df, n_users, n_items, decay=0.001)
 
-    # ── TemporalEASE ─────────────────────────────────────────────────────────
+    # ── TemporalEASE ────────────────────────────────────────────────────
     print("\n[3/7] TemporalEASE...")
     ease   = TemporalEASE(l2_lambda=400.0)
     ease.fit(train_temporal)
     S_ease = ease.score_all_users(exclude_train=True)
     print(f"  Score matrix: {S_ease.shape}")
 
-    # ── ImplicitALS ──────────────────────────────────────────────────────────
+    # ── ImplicitALS ─────────────────────────────────────────────────────
     print("\n[4/7] ImplicitALS...")
     ials = ImplicitALS(n_factors=256, regularization=0.01, iterations=50, alpha=1.0)
     ials.fit(train_binary)
     S_ials = ials.score_all_users()
     print(f"  Score matrix: {S_ials.shape}")
 
-    # ── LightGCN ────────────────────────────────────────────────────────────
+    # ── LightGCN ─────────────────────────────────────────────────────────
     print("\n[5/7] LightGCN...")
     lgcn = LightGCN(
         n_users=n_users, n_items=n_items,
@@ -196,19 +215,68 @@ def main():
     S_lgcn = lgcn.score_all_users(train_binary, batch_size=512)
     print(f"  Score matrix: {S_lgcn.shape}")
 
-    # ── DAREnsemble ──────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────
+    # Materialize propagated embeddings while norm_adj is still live.
+    #
+    # This is the KEY step missing before v4.
+    #
+    # lgcn.propagate() computes:
+    #   E_final = mean(E0, E1, ..., EL)  where  El = A_hat^l @ E0
+    # A_hat is self.norm_adj — built above by build_graph() and held in
+    # GPU/CPU memory for the duration of this process.
+    #
+    # api/main.py loads only the state_dict (user/item_embedding.weight = E0).
+    # It has no adjacency matrix, so it cannot call propagate().
+    # Without this export, the API was silently using raw E0 for /similar,
+    # giving cosine ≈1.0 for completely unrelated items (median pairwise
+    # cosine = 0.84 — effectively random unit vectors).
+    #
+    # By saving E_final here (immediately post-training, norm_adj live),
+    # the API can load lgcn_item_emb.npy directly and get true LightGCN
+    # representations without needing to rebuild the graph at serve time.
+    # ──────────────────────────────────────────────────────────────
+    print("  [LightGCN] materializing propagated embeddings...")
+    lgcn.eval()
+    with torch.no_grad():
+        u_emb_prop, i_emb_prop = lgcn.propagate()   # uses live norm_adj
+        u_emb_np = u_emb_prop.cpu().numpy().astype(np.float32)  # (n_users, d)
+        i_emb_np = i_emb_prop.cpu().numpy().astype(np.float32)  # (n_items, d)
+
+    # Sanity check: propagated embeddings should be far less collapsed than E0
+    unit_i = l2_normalize(i_emb_np)
+    sample_idx = np.random.default_rng(42).choice(len(unit_i), size=200, replace=False)
+    sub = unit_i[sample_idx]
+    gram = sub @ sub.T
+    np.fill_diagonal(gram, 0)
+    med_cos = float(np.median(gram[gram != 0]))
+    print(f"  [LightGCN] propagated embeddings median pairwise cosine: {med_cos:.4f}")
+    if med_cos > 0.5:
+        print(f"  WARNING: median cosine={med_cos:.4f} is still high after propagation.")
+        print(f"  Consider retraining with more epochs, higher n_neg, or lower lr.")
+    else:
+        print(f"  Embedding space looks healthy (median cosine << 1).")
+
+    # L2-normalize and save
+    lgcn_item_emb = l2_normalize(i_emb_np)   # (n_items, d)  unit vectors
+    lgcn_user_emb = l2_normalize(u_emb_np)   # (n_users, d)  unit vectors
+
+    np.save("checkpoints/lgcn_item_emb.npy", lgcn_item_emb)
+    np.save("checkpoints/lgcn_user_emb.npy", lgcn_user_emb)
+    print(f"  Saved lgcn_item_emb.npy {lgcn_item_emb.shape}  lgcn_user_emb.npy {lgcn_user_emb.shape}")
+
+    # ── DAREnsemble ────────────────────────────────────────────────────
     print("\n[6/7] DAREnsemble (learned score fusion)...")
     ensemble   = DAREnsemble()
     ensemble.fit(S_ease=S_ease, S_lgcn=S_lgcn, S_ials=S_ials, val_ground_truth=val_gt)
     S_ensemble = ensemble.predict(S_ease, S_lgcn, S_ials)
 
-    # ── MMR Re-ranking ───────────────────────────────────────────────────────
+    # ── MMR Re-ranking ───────────────────────────────────────────────────
     print("\n[7/7] MMR Re-ranking (diversity-aware)...")
     mmr_reranker = MMRReranker(lambda_=args.mmr_lambda, k=10)
     mmr_reranker.build_genre_sim(genre_matrix)
     mmr_recs = mmr_reranker.rerank_all(S_ensemble, n_candidates=50)
 
-    # ── Evaluation ───────────────────────────────────────────────────────────
+    # ── Evaluation ───────────────────────────────────────────────────────
     print("\n" + "="*60)
     print("Test Results  (80/20 holdout, all 6040 users, full catalog)")
     print("="*60)
@@ -243,10 +311,10 @@ def main():
     print("\nNote: ILD@10 and Coverage not reported in any prior ML-1M paper.")
     print("DARE-Rec is the first system to report all 5 metrics jointly.")
 
-    # ── Save checkpoints ──────────────────────────────────────────────────
+    # ── Save checkpoints ─────────────────────────────────────────────────
     os.makedirs("checkpoints", exist_ok=True)
 
-    # Model weights
+    # Model weights (E0 — stored for completeness / future retraining)
     torch.save(lgcn.state_dict(), "checkpoints/lightgcn.pt")
     np.savez("checkpoints/ease_B.npz", B=ease.B)
     np.savez(
@@ -256,23 +324,23 @@ def main():
     )
     np.save("checkpoints/genre_matrix.npy", genre_matrix)
 
-    # Precomputed score matrices — api/main.py v3 loads these for exact per-user scores
-    # Shape: (6040, 3706) float32 ≈ 85 MB each, ~340 MB total. Acceptable for serving.
+    # Precomputed score matrices — (6040, 3706) float32, used by /recommend
     np.save("checkpoints/scores_ease.npy", S_ease.astype(np.float32))
     np.save("checkpoints/scores_ials.npy", S_ials.astype(np.float32))
     np.save("checkpoints/scores_lgcn.npy", S_lgcn.astype(np.float32))
     np.save("checkpoints/scores_dare.npy", S_ensemble.astype(np.float32))
-    print("  Saved scores_ease/ials/lgcn/dare.npy  (API will use these for exact scores)")
+    print("  Saved scores_ease/ials/lgcn/dare.npy")
+
+    # lgcn_item_emb.npy and lgcn_user_emb.npy already saved above (post-propagation)
 
     # Ensemble weights
     with open("checkpoints/ensemble_weights.json", "w") as f:
         json.dump({"alpha": ensemble.alpha, "beta": ensemble.beta, "gamma": ensemble.gamma}, f, indent=2)
 
-    # Item metadata — real movie titles
+    # Item metadata
     with open("checkpoints/item_metadata.json", "w") as f:
         json.dump(item_metadata, f)
     print(f"  Saved item_metadata.json ({len(item_metadata):,} titles)")
-    # Verify a few titles to confirm they loaded correctly
     sample_keys = list(item_metadata.keys())[:3]
     for k in sample_keys:
         print(f"    item {k}: {item_metadata[k]}")
@@ -293,11 +361,12 @@ def main():
 
     print("\n✔ Saved checkpoints:")
     print("    lightgcn.pt, ease_B.npz, ials_factors.npz, genre_matrix.npy")
+    print("    lgcn_item_emb.npy, lgcn_user_emb.npy   ← NEW: propagated embeddings")
     print("    scores_ease.npy, scores_ials.npy, scores_lgcn.npy, scores_dare.npy")
     print("    ensemble_weights.json, item_metadata.json, metrics.json")
     print("✔ results.json saved")
     print("✔ Start API:  uvicorn api.main:app --host 0.0.0.0 --port 8000")
-    print("  Then check: curl http://127.0.0.1:8000/health  (titles_loaded should be true)")
+    print("  Then check: curl http://127.0.0.1:8000/health")
     print("Done.")
 
 
