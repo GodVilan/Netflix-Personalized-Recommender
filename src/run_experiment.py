@@ -1,5 +1,5 @@
 """
-run_experiment.py  —  DARE-Rec full experiment (2026-04-10)
+run_experiment.py  —  DARE-Rec full experiment (2026-04-10, v3)
 
 Pipeline:
   1. Load MovieLens-1M, 80/20 holdout split
@@ -9,18 +9,15 @@ Pipeline:
   5. DAREnsemble: grid search α/β/γ on val NDCG@10
   6. MMRReranker: genre-diverse re-ranking on ensemble scores
   7. Full evaluation: NDCG@10, Recall@10, HitRate@10, ILD@10, Coverage, Novelty
-  8. Save checkpoints + results.json + item_metadata.json
+  8. Save checkpoints + score matrices + results.json + item_metadata.json
 
 Usage:
   python src/run_experiment.py --data_dir ml-1m/
   python src/run_experiment.py --data_dir ml-1m/ --skip_ab
 
-Expected test NDCG@10 (80/20 holdout, all 6040 users):
-  TemporalEASE   ~0.33-0.34
-  ImplicitALS    ~0.28-0.31
-  LightGCN       ~0.32-0.35
-  DAREnsemble    ~0.35-0.38   <- SOTA target
-  DARE+MMR       ~0.33-0.36   <- slightly lower NDCG, higher ILD
+New in v3:
+  Saves scores_ease.npy, scores_ials.npy, scores_lgcn.npy, scores_dare.npy
+  so api/main.py v3 can return exact training-time scores without recomputing.
 """
 
 import argparse
@@ -49,11 +46,7 @@ from trainer import train_lightgcn, BPRDataset, get_device
 
 
 # ─── helpers ─────────────────────────────────────────────────────────────────
-def scores_to_recs(
-    score_matrix: np.ndarray,
-    k: int = 10,
-) -> dict:
-    """Convert (n_users, n_items) score matrix to {uid: [top-k items]}."""
+def scores_to_recs(score_matrix: np.ndarray, k: int = 10) -> dict:
     recs = {}
     for uid in range(len(score_matrix)):
         top_k = np.argsort(score_matrix[uid])[::-1][:k].tolist()
@@ -62,13 +55,8 @@ def scores_to_recs(
 
 
 def evaluate_score_matrix(
-    score_matrix: np.ndarray,
-    ground_truth: dict,
-    genre_matrix: np.ndarray,
-    item_popularity: dict,
-    n_items: int,
-    k: int = 10,
-    label: str = "",
+    score_matrix, ground_truth, genre_matrix,
+    item_popularity, n_items, k=10, label="",
 ) -> dict:
     recs = scores_to_recs(score_matrix, k=k)
     metrics = evaluate_recommendations(
@@ -152,54 +140,44 @@ def main():
     print(f"  Split: 80/20 holdout (matches Anelli et al. 2022 protocol)")
 
     genre_matrix, genre_names = get_genre_features(movies, item_enc)
-    n_genres = len(genre_names)
-    print(f"  Genres: {n_genres}")
+    print(f"  Genres: {len(genre_names)}")
 
-    # Build item metadata for API title lookup
     item_metadata = get_item_metadata(movies, item_enc)
 
-    # Ground truth dicts
-    test_gt = test_df.groupby("user_idx")["item_idx"].apply(set).to_dict()
-    val_gt  = val_df.groupby("user_idx")["item_idx"].apply(set).to_dict()
-
-    # Item popularity from train
+    test_gt         = test_df.groupby("user_idx")["item_idx"].apply(set).to_dict()
+    val_gt          = val_df.groupby("user_idx")["item_idx"].apply(set).to_dict()
     item_popularity = train_df["item_idx"].value_counts().to_dict()
     seen_items      = train_df.groupby("user_idx")["item_idx"].apply(set).to_dict()
 
-    train_binary  = build_interaction_matrix(train_df, n_users, n_items)
+    train_binary   = build_interaction_matrix(train_df, n_users, n_items)
     train_temporal = build_temporal_interaction_matrix(train_df, n_users, n_items, decay=0.001)
 
     # ── TemporalEASE ─────────────────────────────────────────────────────────
     print("\n[3/7] TemporalEASE...")
-    ease = TemporalEASE(l2_lambda=400.0)
+    ease   = TemporalEASE(l2_lambda=400.0)
     ease.fit(train_temporal)
     S_ease = ease.score_all_users(exclude_train=True)
     print(f"  Score matrix: {S_ease.shape}")
 
     # ── ImplicitALS ──────────────────────────────────────────────────────────
     print("\n[4/7] ImplicitALS...")
-    ials = ImplicitALS(
-        n_factors=256, regularization=0.01,
-        iterations=50, alpha=1.0,
-    )
+    ials = ImplicitALS(n_factors=256, regularization=0.01, iterations=50, alpha=1.0)
     ials.fit(train_binary)
     S_ials = ials.score_all_users()
     print(f"  Score matrix: {S_ials.shape}")
 
-    # ── LightGCN ─────────────────────────────────────────────────────────────
+    # ── LightGCN ────────────────────────────────────────────────────────────
     print("\n[5/7] LightGCN...")
     lgcn = LightGCN(
         n_users=n_users, n_items=n_items,
-        embed_dim=args.lgcn_dim,
-        n_layers=args.lgcn_layers,
+        embed_dim=args.lgcn_dim, n_layers=args.lgcn_layers,
     )
     lgcn.build_graph(train_binary, device)
 
     bpr_dataset = BPRDataset(
         user_ids=train_df["user_idx"].values,
         item_ids=train_df["item_idx"].values,
-        n_items=n_items,
-        seen_items=seen_items,
+        n_items=n_items, seen_items=seen_items,
     )
 
     def val_fn_lgcn(m):
@@ -213,19 +191,15 @@ def main():
 
     lgcn = train_lightgcn(
         model=lgcn, train_dataset=bpr_dataset, val_fn=val_fn_lgcn,
-        epochs=args.epochs, batch_size=4096, lr=args.lgcn_lr,
-        device=device,
+        epochs=args.epochs, batch_size=4096, lr=args.lgcn_lr, device=device,
     )
     S_lgcn = lgcn.score_all_users(train_binary, batch_size=512)
     print(f"  Score matrix: {S_lgcn.shape}")
 
     # ── DAREnsemble ──────────────────────────────────────────────────────────
     print("\n[6/7] DAREnsemble (learned score fusion)...")
-    ensemble = DAREnsemble()
-    ensemble.fit(
-        S_ease=S_ease, S_lgcn=S_lgcn, S_ials=S_ials,
-        val_ground_truth=val_gt,
-    )
+    ensemble   = DAREnsemble()
+    ensemble.fit(S_ease=S_ease, S_lgcn=S_lgcn, S_ials=S_ials, val_ground_truth=val_gt)
     S_ensemble = ensemble.predict(S_ease, S_lgcn, S_ials)
 
     # ── MMR Re-ranking ───────────────────────────────────────────────────────
@@ -241,22 +215,18 @@ def main():
 
     results = {}
     for label, S in [
-        ("TemporalEASE",  S_ease),
-        ("ImplicitALS",   S_ials),
-        ("LightGCN",      S_lgcn),
-        ("DAREnsemble",   S_ensemble),
+        ("TemporalEASE", S_ease),
+        ("ImplicitALS",  S_ials),
+        ("LightGCN",     S_lgcn),
+        ("DAREnsemble",  S_ensemble),
     ]:
         results[label] = evaluate_score_matrix(
             S, test_gt, genre_matrix, item_popularity, n_items, label=label
         )
 
     mmr_metrics = evaluate_recommendations(
-        recommendations=mmr_recs,
-        ground_truth=test_gt,
-        k_values=[10],
-        item_popularity=item_popularity,
-        n_items=n_items,
-        genre_matrix=genre_matrix,
+        recommendations=mmr_recs, ground_truth=test_gt, k_values=[10],
+        item_popularity=item_popularity, n_items=n_items, genre_matrix=genre_matrix,
     )
     results["DARE+MMR"] = mmr_metrics
     m = mmr_metrics
@@ -273,10 +243,10 @@ def main():
     print("\nNote: ILD@10 and Coverage not reported in any prior ML-1M paper.")
     print("DARE-Rec is the first system to report all 5 metrics jointly.")
 
-    # ── Save ─────────────────────────────────────────────────────────────────
+    # ── Save checkpoints ──────────────────────────────────────────────────
     os.makedirs("checkpoints", exist_ok=True)
 
-    # Model checkpoints
+    # Model weights
     torch.save(lgcn.state_dict(), "checkpoints/lightgcn.pt")
     np.savez("checkpoints/ease_B.npz", B=ease.B)
     np.savez(
@@ -286,20 +256,28 @@ def main():
     )
     np.save("checkpoints/genre_matrix.npy", genre_matrix)
 
+    # Precomputed score matrices — api/main.py v3 loads these for exact per-user scores
+    # Shape: (6040, 3706) float32 ≈ 85 MB each, ~340 MB total. Acceptable for serving.
+    np.save("checkpoints/scores_ease.npy", S_ease.astype(np.float32))
+    np.save("checkpoints/scores_ials.npy", S_ials.astype(np.float32))
+    np.save("checkpoints/scores_lgcn.npy", S_lgcn.astype(np.float32))
+    np.save("checkpoints/scores_dare.npy", S_ensemble.astype(np.float32))
+    print("  Saved scores_ease/ials/lgcn/dare.npy  (API will use these for exact scores)")
+
     # Ensemble weights
     with open("checkpoints/ensemble_weights.json", "w") as f:
-        json.dump({
-            "alpha": ensemble.alpha,
-            "beta":  ensemble.beta,
-            "gamma": ensemble.gamma,
-        }, f, indent=2)
+        json.dump({"alpha": ensemble.alpha, "beta": ensemble.beta, "gamma": ensemble.gamma}, f, indent=2)
 
-    # Item metadata — real movie titles for API responses
+    # Item metadata — real movie titles
     with open("checkpoints/item_metadata.json", "w") as f:
         json.dump(item_metadata, f)
     print(f"  Saved item_metadata.json ({len(item_metadata):,} titles)")
+    # Verify a few titles to confirm they loaded correctly
+    sample_keys = list(item_metadata.keys())[:3]
+    for k in sample_keys:
+        print(f"    item {k}: {item_metadata[k]}")
 
-    # Full results — saved in both root and checkpoints/ so /metrics finds it
+    # Results JSON
     output = {
         "models": results,
         "ensemble_weights": {
@@ -313,11 +291,13 @@ def main():
         with open(path, "w") as f:
             json.dump(output, f, indent=2)
 
-    print("\n✔ results.json saved")
-    print("✔ checkpoints/ saved (lightgcn.pt, ease_B.npz, ials_factors.npz,")
-    print("                      genre_matrix.npy, ensemble_weights.json,")
-    print("                      item_metadata.json, metrics.json)")
-    print("✔ API: uvicorn api.main:app --host 0.0.0.0 --port 8000")
+    print("\n✔ Saved checkpoints:")
+    print("    lightgcn.pt, ease_B.npz, ials_factors.npz, genre_matrix.npy")
+    print("    scores_ease.npy, scores_ials.npy, scores_lgcn.npy, scores_dare.npy")
+    print("    ensemble_weights.json, item_metadata.json, metrics.json")
+    print("✔ results.json saved")
+    print("✔ Start API:  uvicorn api.main:app --host 0.0.0.0 --port 8000")
+    print("  Then check: curl http://127.0.0.1:8000/health  (titles_loaded should be true)")
     print("Done.")
 
 
