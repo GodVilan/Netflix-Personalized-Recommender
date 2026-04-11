@@ -1,5 +1,5 @@
 """
-models.py  —  DARE-Rec rewrite (2026-04-10, audit-fixed 2026-04-10)
+models.py  —  DARE-Rec rewrite (2026-04-10, audit-fixed 2026-04-10, ials-fix 2026-04-10)
 
 Models implemented:
   1. TemporalEASE       — time-decayed EASE^R (unpublished variant)
@@ -106,10 +106,6 @@ class TemporalEASE:
         Compute scores for ALL users at once via matrix multiply.
         Returns (n_users, n_items) float32 score matrix.
         Used by DAREnsemble for fast ensemble scoring.
-
-        FIX (audit): Use explicit row/col indices from nonzero() instead of
-        boolean array indexing. Boolean 2D indexing on a 2D array flattens
-        to 1D in numpy ≥1.25 strict mode, causing shape mismatches.
         """
         print("  [TemporalEASE] computing full score matrix (X @ B)...")
         X_dense = self._X.toarray().astype(np.float32)   # (n_users, n_items)
@@ -130,15 +126,21 @@ class ImplicitALS:
     Hyperparameters tuned for ML-1M 80/20 holdout:
       n_factors=256, alpha=1.0, reg=0.01, iterations=50
 
-    Note on alpha: with 80/20 holdout each user has ~130 train items.
-    alpha=1.0 (c = 1+1 = 2 for positives) is conservative but stable.
-    The `implicit` library applies alpha internally as c = 1 + alpha*r.
+    implicit API contract (v0.5+):
+      fit(user_items)  expects shape (n_users, n_items)  ← user_item directly
+      After fitting:
+        model.user_factors.shape == (n_users, n_factors)
+        model.item_factors.shape == (n_items, n_factors)
+      So  user_factors @ item_factors.T  →  (n_users, n_items)  ✓
 
-    Convention:
-      implicit.als expects item_user (item×user) for fitting.
-      After fitting, model.user_factors.shape = (n_users, n_factors)
-                     model.item_factors.shape = (n_items, n_factors)
-      So U @ V.T gives (n_users, n_items) correctly.
+    Previous bug:
+      Code was calling fit(user_item.T * alpha), i.e. fit on item_user matrix
+      of shape (n_items, n_users). The library then assigns:
+        user_factors → rows of the input → n_items rows  (WRONG)
+        item_factors → cols of the input → n_users rows  (WRONG)
+      Result: U @ V.T was (n_items, n_users), score matrix was transposed,
+      and _user_item.nonzero() col indices (max=n_items-1) were applied as
+      row indices into S (size n_items), hitting out-of-bounds at index 3706.
     """
 
     def __init__(
@@ -158,6 +160,8 @@ class ImplicitALS:
         self.random_state = random_state
         self.model = None
         self._user_item: Optional[csr_matrix] = None
+        self.n_users: Optional[int] = None
+        self.n_items: Optional[int] = None
 
     def fit(self, user_item: csr_matrix) -> "ImplicitALS":
         try:
@@ -165,9 +169,14 @@ class ImplicitALS:
         except ImportError:
             raise ImportError("pip install implicit")
 
-        self._user_item = user_item.copy()
-        # implicit expects item_user matrix
-        item_user = (user_item.T * self.alpha).tocsr().astype(np.float32)
+        # Store in correct (n_users, n_items) orientation
+        self._user_item = user_item.tocsr().astype(np.float32).copy()
+        self.n_users, self.n_items = self._user_item.shape
+
+        # Apply confidence scaling: c_ui = 1 + alpha * r_ui
+        # Pass the weighted user_item matrix directly — NOT transposed.
+        # implicit.als.fit() expects (n_users, n_items) user_items matrix.
+        weighted = (self._user_item * self.alpha).tocsr().astype(np.float32)
 
         self.model = AlternatingLeastSquares(
             factors=self.n_factors,
@@ -177,7 +186,19 @@ class ImplicitALS:
             calculate_training_loss=False,
             random_state=self.random_state,
         )
-        self.model.fit(item_user, show_progress=True)
+        # Correct call: user_items shape = (n_users, n_items)
+        self.model.fit(weighted, show_progress=True)
+
+        # Shape guard — fail immediately if implicit swaps orientation
+        uf = np.asarray(self.model.user_factors)
+        vf = np.asarray(self.model.item_factors)
+        if uf.shape[0] != self.n_users or vf.shape[0] != self.n_items:
+            raise ValueError(
+                f"[ImplicitALS] Factor shape mismatch after fit — "
+                f"user_factors={uf.shape}, item_factors={vf.shape}, "
+                f"expected ({self.n_users}, f) and ({self.n_items}, f). "
+                f"Check implicit library version and input matrix orientation."
+            )
         return self
 
     def recommend(
@@ -186,14 +207,23 @@ class ImplicitALS:
         n: int = 10,
         exclude_seen: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        # implicit's recommend() returns (item_ids, scores)
-        # filter_already_liked handles seen-item exclusion natively
-        items, _ = self.model.recommend(
-            user_idx,
-            self._user_item[user_idx],
-            N=n + (len(exclude_seen) if exclude_seen is not None else 0),
-            filter_already_liked=True,
-        )
+        # implicit ≥0.6: filter_already_liked_items kwarg
+        # implicit <0.6:  filter_already_liked kwarg
+        # Try both for compatibility
+        try:
+            items, _ = self.model.recommend(
+                user_idx,
+                self._user_item[user_idx],
+                N=n + (len(exclude_seen) if exclude_seen is not None else 0),
+                filter_already_liked_items=True,
+            )
+        except TypeError:
+            items, _ = self.model.recommend(
+                user_idx,
+                self._user_item[user_idx],
+                N=n + (len(exclude_seen) if exclude_seen is not None else 0),
+                filter_already_liked=True,
+            )
         return np.array(items[:n])
 
     def score_all_users(self) -> np.ndarray:
@@ -201,20 +231,25 @@ class ImplicitALS:
         Returns (n_users, n_items) float32 score matrix.
         S = user_factors @ item_factors.T
 
-        FIX (audit): Original code used boolean 2D array X as index into S,
-        i.e. S[X] = -np.inf. In numpy ≥1.25 strict boolean indexing mode,
-        applying a (n_users, n_items) bool mask to a (n_users, n_items) array
-        raises IndexError when the mask axis size doesn't match expectation
-        along axis 0. Root cause: numpy treats the 2D bool as a flat 1D
-        boolean index against the first axis, expecting size n_users but
-        getting the full matrix. Fix: use explicit (row, col) index pairs
-        from nonzero() — this is unambiguous regardless of numpy version.
+        user_factors: (n_users, f)  — guaranteed by shape guard in fit()
+        item_factors: (n_items, f)  — guaranteed by shape guard in fit()
+        S:            (n_users, n_items)
         """
         print("  [ImplicitALS] computing full score matrix...")
-        U = np.array(self.model.user_factors)  # (n_users, n_factors)
-        V = np.array(self.model.item_factors)  # (n_items, n_factors)
-        S = (U @ V.T).astype(np.float32)      # (n_users, n_items)
-        # mask training items using explicit indices — not boolean array
+        U = np.asarray(self.model.user_factors, dtype=np.float32)  # (n_users, f)
+        V = np.asarray(self.model.item_factors, dtype=np.float32)  # (n_items, f)
+
+        # Redundant guard — catches any implicit version weirdness at runtime
+        if U.shape[0] != self.n_users or V.shape[0] != self.n_items:
+            raise ValueError(
+                f"[ImplicitALS] score_all_users shape mismatch: "
+                f"U={U.shape}, V={V.shape}, "
+                f"n_users={self.n_users}, n_items={self.n_items}"
+            )
+
+        S = (U @ V.T).astype(np.float32)   # (n_users, n_items)
+
+        # Mask training items with explicit (row, col) indices
         rows, cols = self._user_item.nonzero()
         S[rows, cols] = -np.inf
         return S
@@ -346,9 +381,6 @@ class LightGCN(nn.Module):
     ) -> np.ndarray:
         """
         Returns (n_users, n_items) score matrix with training items masked.
-
-        FIX (audit): Same boolean-indexing issue as ImplicitALS.
-        Use nonzero() indices explicitly.
         """
         print("  [LightGCN] computing full score matrix...")
         self.eval()
@@ -401,13 +433,6 @@ class DAREnsemble:
         k: int = 10,
         step: float = 0.05,
     ):
-        """
-        Grid search over simplex. Evaluates ~231 weight combinations.
-
-        FIX (audit): was 'from src.metrics import ndcg_at_k' which breaks
-        when the module is imported from within src/ (sys.path = src/).
-        Changed to relative-style direct import.
-        """
         from metrics import ndcg_at_k  # relative import — works from src/ context
         print(f"  [DAREnsemble] grid searching simplex (step={step})...")
         best_ndcg = -1
@@ -494,14 +519,8 @@ class MMRReranker:
     ) -> List[int]:
         """
         MMR re-ranking for a single user.
-        score_vec:    (n_items,) relevance scores (higher = better).
-                      Items already seen in training must be pre-masked to -inf
-                      in score_vec before calling this (done by score_all_users).
-        n_candidates: pool size before re-ranking (top-50 by score).
-
-        FIX (audit): removed unused 'candidate_items' positional argument that
-        was being passed from rerank_all() but ignored inside the function body,
-        causing silent logical errors if callers passed conflicting data.
+        score_vec:    (n_items,) relevance scores — seen items pre-masked to -inf.
+        n_candidates: candidate pool size before MMR selection.
         """
         valid_items = np.where(score_vec > -np.inf)[0]
         if len(valid_items) == 0:
@@ -509,7 +528,6 @@ class MMRReranker:
 
         top_cands = valid_items[np.argsort(score_vec[valid_items])[::-1][:n_candidates]]
 
-        # Normalise scores to [0, 1] for MMR
         cand_scores = score_vec[top_cands]
         s_min, s_max = cand_scores.min(), cand_scores.max()
         if s_max > s_min:
@@ -549,10 +567,6 @@ class MMRReranker:
         """
         Apply MMR re-ranking to all users.
         Returns {user_idx: [top-k item list]}.
-
-        FIX (audit): no longer passes np.arange(n_items) as a spurious
-        second positional argument to rerank() — that argument has been
-        removed from rerank()'s signature.
         """
         print(f"  [MMR] re-ranking all {len(score_matrix)} users (λ={self.lambda_})...")
         recommendations = {}
